@@ -26,6 +26,8 @@ pub struct Executor<'a> {
     pub stop: &'a AtomicBool,
     /// Cargo build units unused this long are trimmed.
     pub unit_idle: Duration,
+    /// The reads of a target's hash files seen as they happened, on Linux.
+    pub observed: &'a dyn Fn(&Path) -> cargo::Observed,
 }
 
 enum Outcome {
@@ -182,7 +184,11 @@ impl Executor<'_> {
             freed += self.remove(&leftover)?;
         }
         if self.dry_run {
-            let garbage = cargo::garbage(&target.root, self.unit_idle, SystemTime::now())?;
+            cargo::remember_hashes(&target.root)
+                .with_context(|| format!("reading {}", target.root.display()))?;
+            let observed = (self.observed)(&target.root);
+            let garbage =
+                cargo::garbage(&target.root, self.unit_idle, SystemTime::now(), &observed)?;
             let bytes: u64 = garbage
                 .paths
                 .iter()
@@ -193,9 +199,14 @@ impl Executor<'_> {
         let Some(locks) = lock_profiles(&target.root)? else {
             return Ok(Outcome::Skipped("a Cargo build is running"));
         };
-        cargo::record_reads(&target.root)
+        cargo::record_reads(&target.root, &(self.observed)(&target.root))
             .with_context(|| format!("recording reads in {}", target.root.display()))?;
-        let garbage = cargo::garbage(&target.root, self.unit_idle, SystemTime::now())?;
+        let garbage = cargo::garbage(
+            &target.root,
+            self.unit_idle,
+            SystemTime::now(),
+            &cargo::Observed::new(),
+        )?;
         if garbage.paths.is_empty() {
             return Ok(Outcome::Freed(freed));
         }
@@ -230,7 +241,7 @@ impl Executor<'_> {
         };
         // Checked under the locks, so no build slips in after it. Creating a missing lock file
         // changes the profile's mtime: the target is then kept until the next pass.
-        cargo::record_reads(&target.root)
+        cargo::record_reads(&target.root, &(self.observed)(&target.root))
             .with_context(|| format!("recording reads in {}", target.root.display()))?;
         // The read log keeps whole seconds, so only a later second means Cargo came back.
         let planned = target.last_used + Duration::from_secs(1);
@@ -377,6 +388,7 @@ mod tests {
             dry_run,
             stop: &RUNNING,
             unit_idle: Duration::ZERO,
+            observed: &|_| cargo::Observed::new(),
         }
     }
 

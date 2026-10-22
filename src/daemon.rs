@@ -18,7 +18,7 @@ use crate::planner::{Pressure, Sweep, plan};
 use crate::sys::DiskSpace;
 
 /// How long to hold off disk-pressure cleanup after a round that did not free space, for
-/// instance because local Time Machine snapshots still hold the deleted files.
+/// instance because local Time Machine or btrfs snapshots still hold the deleted files.
 const PRESSURE_PAUSE: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +102,19 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, Arc::clone(&stop))?;
     }
+    #[cfg(target_os = "linux")]
+    let reads = crate::inotify::Reads::start()
+        .inspect_err(|e| tracing::warn!("cannot watch Cargo reads: {e}"))
+        .ok();
+    #[cfg(target_os = "linux")]
+    let observed = |target: &std::path::Path| {
+        reads
+            .as_ref()
+            .map(|reads| reads.observed(target))
+            .unwrap_or_default()
+    };
+    #[cfg(target_os = "macos")]
+    let observed = |_: &std::path::Path| crate::cargo::Observed::new();
     let cleaner = Cleaner {
         env,
         config,
@@ -109,6 +122,7 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
             dry_run: config.dry_run,
             stop: &stop,
             unit_idle: config.unit_idle,
+            observed: &observed,
         },
     };
     let mut state = State::load(&env.state_file());
@@ -156,6 +170,15 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
         });
         if freed > 0 {
             tracing::info!("pass freed {}", format_bytes(freed));
+        }
+        // After the pass, which remembered the hash files of new targets: opening them before
+        // the watch began goes unseen.
+        #[cfg(target_os = "linux")]
+        if let Some(reads) = &reads
+            && !matches!(pass, Pass::Orphans)
+        {
+            let inventory = discovery::discover(env, &config.extra_roots, &state);
+            reads.watch(inventory.targets.iter().map(|target| target.root.as_path()));
         }
 
         if !matches!(pass, Pass::Orphans) {

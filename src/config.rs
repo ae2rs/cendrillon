@@ -39,12 +39,12 @@ pub struct Config {
     /// How often the daemon applies the idle deadlines.
     #[serde(with = "humantime_serde")]
     pub sweep_interval: Duration,
-    /// Minimum time between two pressure evictions, so space that macOS frees late
+    /// Minimum time between two pressure evictions, so space the system frees late
     /// (for example after thinning local snapshots) is not reclaimed twice.
     #[serde(with = "humantime_serde")]
     pub pressure_cooldown: Duration,
     /// Find caches and targets anywhere in the home directory: walk it once, then follow its
-    /// changes.
+    /// changes on macOS, or walk it again every few hours on Linux.
     pub scan_home: bool,
     /// Extra directories to search for Bazel caches, besides the defaults and bazelrc files.
     pub extra_roots: Vec<PathBuf>,

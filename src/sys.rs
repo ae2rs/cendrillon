@@ -4,10 +4,11 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};
@@ -101,6 +102,15 @@ pub fn bazel_server(output_base: &Path) -> Option<Pid> {
     let text = std::fs::read_to_string(output_base.join("server/server.pid.txt")).ok()?;
     let pid = Pid::from_raw(text.trim().parse().ok()?);
     kill(pid, None).ok()?;
+    let named = output_base_flag(pid)?;
+    let same = named == output_base
+        || std::fs::canonicalize(&named).ok()? == std::fs::canonicalize(output_base).ok()?;
+    same.then_some(pid)
+}
+
+/// The `--output_base` a process was started with.
+#[cfg(target_os = "macos")]
+fn output_base_flag(pid: Pid) -> Option<PathBuf> {
     let ps = Command::new("/bin/ps")
         .args(["-ww", "-o", "command=", "-p"])
         .arg(pid.to_string())
@@ -109,10 +119,106 @@ pub fn bazel_server(output_base: &Path) -> Option<Pid> {
     let command = String::from_utf8_lossy(&ps.stdout);
     // The value runs to the next flag, so paths with spaces survive.
     let (_, rest) = command.split_once("--output_base=")?;
-    let named = Path::new(rest.split(" --").next()?.trim_end());
-    let same = named == output_base
-        || std::fs::canonicalize(named).ok()? == std::fs::canonicalize(output_base).ok()?;
-    same.then_some(pid)
+    Some(PathBuf::from(rest.split(" --").next()?.trim_end()))
+}
+
+/// The `--output_base` a process was started with. `/proc` separates the arguments, so the
+/// value is exact.
+#[cfg(target_os = "linux")]
+fn output_base_flag(pid: Pid) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    cmdline
+        .split(|&byte| byte == 0)
+        .find_map(|arg| arg.strip_prefix(b"--output_base="))
+        .map(|value| PathBuf::from(std::ffi::OsStr::from_bytes(value)))
+}
+
+/// The command line of every running process, its arguments joined by spaces.
+#[cfg(target_os = "macos")]
+pub fn command_lines() -> Vec<String> {
+    let Ok(ps) = Command::new("/bin/ps")
+        .args(["-axww", "-o", "command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The command line of every running process, its arguments joined by spaces.
+#[cfg(target_os = "linux")]
+pub fn command_lines() -> Vec<String> {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    procs
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.parse::<u32>().is_ok())
+        })
+        .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+        .filter(|cmdline| !cmdline.is_empty())
+        .map(|cmdline| {
+            let joined: Vec<u8> = cmdline
+                .strip_suffix(&[0])
+                .unwrap_or(&cmdline)
+                .iter()
+                .map(|&byte| if byte == 0 { b' ' } else { byte })
+                .collect();
+            String::from_utf8_lossy(&joined).into_owned()
+        })
+        .collect()
+}
+
+/// Sets a file's access time, leaving its modification time alone.
+#[cfg(target_os = "macos")]
+pub fn set_accessed(path: &Path, time: SystemTime) -> io::Result<()> {
+    File::open(path)?.set_times(std::fs::FileTimes::new().set_accessed(time))
+}
+
+/// Sets a file's access time, leaving its modification time alone. By path, so the file is
+/// not opened: the daemon takes an open of a hash file for a read by Cargo.
+#[cfg(target_os = "linux")]
+pub fn set_accessed(path: &Path, time: SystemTime) -> io::Result<()> {
+    use nix::sys::stat::{UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+    let since = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    utimensat(
+        nix::fcntl::AT_FDCWD,
+        path,
+        &TimeSpec::from_duration(since),
+        &TimeSpec::UTIME_OMIT,
+        UtimensatFlags::NoFollowSymlink,
+    )
+    .map_err(io::Error::from)
+}
+
+/// Opens a file to read it without moving its access time, which is how cendrillon tells
+/// that Cargo read a file. Linux only allows that to the file's owner, so falls back to a
+/// plain open: the caller then puts the access time back.
+pub fn open_quietly(path: &Path) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+        {
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+            opened => return opened,
+        }
+    }
+    File::open(path)
 }
 
 /// Stops a process: SIGTERM, then SIGKILL if it is still alive after `grace`.
@@ -201,11 +307,19 @@ pub mod testing {
         /// Bazel's `fcntl` record lock on byte 0.
         pub fn fcntl(path: &Path) -> Self {
             // struct flock on macOS: off_t l_start, off_t l_len, pid_t l_pid, short l_type,
-            // short l_whence.
+            // short l_whence. On Linux: short l_type, short l_whence, then the offsets aligned
+            // to 8 bytes, then pid_t l_pid, padded to 32 bytes.
+            let layout = if cfg!(target_os = "macos") {
+                r#"pack("q q l s s", 0, 1, 0, F_WRLCK, 0)"#
+            } else {
+                r#"pack("s s x4 q q l x4", F_WRLCK, 0, 0, 1, 0)"#
+            };
             Self::spawn(
                 path,
-                r#"my $request = pack("q q l s s", 0, 1, 0, F_WRLCK, 0);
-                   fcntl($f, F_SETLK, $request) or die "lock: $!";"#,
+                &format!(
+                    r#"my $request = {layout};
+                       fcntl($f, F_SETLK, $request) or die "lock: $!";"#
+                ),
             )
         }
 

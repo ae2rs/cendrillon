@@ -1,6 +1,6 @@
 # cendrillon
 
-Cinderella for your disk. A macOS background daemon that cleans up after Bazel and Cargo, since they never do.
+Cinderella for your disk. A macOS and Linux background daemon that cleans up after Bazel and Cargo, since they never do.
 
 ## Why
 - Bazel creates an output base for every git worktree, often tens of GB each. It stays on disk after you delete the worktree.
@@ -11,11 +11,11 @@ Cinderella for your disk. A macOS background daemon that cleans up after Bazel a
 ## Install
 ```sh
 cargo install cendrillon
-cendrillon install   # start now and at every login
+cendrillon install   # start now and at every login: a launchd agent, or a systemd user service
 ```
 
 > [!WARNING]
-> The first run walks your home directory once, and the first few runs may delete a backlog of files. Expect `fseventsd` (the macOS file events service) to use noticeable CPU for a while. It settles once the backlog is gone.
+> The first run walks your home directory once, and the first few runs may delete a backlog of files. On macOS, expect `fseventsd` (the macOS file events service) to use noticeable CPU for a while. It settles once the backlog is gone.
 
 Trust issues? Look first:
 ```sh
@@ -25,7 +25,7 @@ cendrillon trim --dry-run target  # what trimming one Cargo target would delete
 ```
 
 - Stop and remove: `cendrillon uninstall`
-- Logs: `~/Library/Logs/cendrillon.log`
+- Logs: `~/Library/Logs/cendrillon.log` on macOS, `journalctl --user -u cendrillon` on Linux
 
 ## What it deletes
 | What | When |
@@ -44,7 +44,7 @@ Everything it deletes can be rebuilt or downloaded again.
 - Below 15% free space, it evicts idle output bases and disk-cache entries, oldest first, until 25% is free.
 - It never touches anything used in the last 2 hours.
 - It runs at most every 10 minutes.
-- If a round frees nothing, it pauses for an hour. (Usually Time Machine local snapshots holding on to the files.)
+- If a round frees nothing, it pauses for an hour. (Usually Time Machine local snapshots, or btrfs snapshots, holding on to the files.)
 
 ### What it leaves alone
 - Bazel's repository contents cache (`contents/`). Live external repositories point into it. Use Bazel's `--repo_contents_cache_gc_*` flags instead.
@@ -64,20 +64,27 @@ Incremental-compilation directories follow their crate's units.
 - Each hour, cendrillon records which hash files were read in `<target>/.cendrillon-reads.json`. Then it sets their access times back, so the next read shows too.
 - Cargo only checks contents and modification times. It never notices.
 
+On Linux:
+- The default `relatime` mount option updates access times the same way. With `noatime`, they never change.
+- So the daemon also watches each unit directory with inotify, which reports every open of a hash file on any mount. That takes one inotify watch per unit; the default limit (`fs.inotify.max_user_watches`) is far above what large targets need.
+- inotify does not say who opened a file. cendrillon remembers each hash file's contents in `.cendrillon-reads.json` and only opens one again after Cargo rewrote it. Its own reads, including those of `status` and `--dry-run`, never pass for Cargo's.
+- Reads only show while the daemon runs.
+
 ### Limits
 - Units from an old `[profile]` setting keep their newest generation until the target goes idle or the disk fills up.
-- APFS clones share blocks. Trimming a cloned target (say, copied into a new worktree) frees space only once the copy is trimmed too.
+- APFS clones and reflinks (XFS, btrfs; `cp` makes them by default) share blocks. Trimming a cloned target (say, copied into a new worktree) frees space only once the copy is trimmed too.
 - A unit it cannot read stops the trim of the whole target.
 
 ## Where it looks
-- Bazel's default roots: `/private/var/tmp/_bazel_$USER`, `~/Library/Caches/bazel`, `~/.cache/bazel`.
+- Bazel's default roots: `/private/var/tmp/_bazel_$USER`, `~/Library/Caches/bazel` and `~/.cache/bazel` on macOS; `~/.cache/bazel` and `$XDG_CACHE_HOME/bazel` on Linux.
 - Paths given to `--output_user_root`, `--output_base`, `--install_base`, `--disk_cache` and `--repository_cache` in:
   - `~/.bazelrc` and `/etc/bazel.bazelrc`
   - the `.bazelrc` of every workspace it finds, following `import` and `try-import`
   - the command lines of running Bazel servers
   - the commands each output base logged to its `java.log`, so flags given only on the command line count too
 - Your home directory. It skips:
-  - folders macOS protects (Desktop, Documents, Downloads, Pictures, Movies, Music, Public, `~/Library`), so no Full Disk Access and no permission prompt. Bazel's folder in `~/Library/Caches` is a default root, and Bazel caches elsewhere in it are named in Bazel's records.
+  - on macOS, folders macOS protects (Desktop, Documents, Downloads, Pictures, Movies, Music, Public, `~/Library`), so no Full Disk Access and no permission prompt. Bazel's folder in `~/Library/Caches` is a default root, and Bazel caches elsewhere in it are named in Bazel's records.
+  - on Linux, the trash (`~/.local/share/Trash`)
   - `.git`, `node_modules`, `.Trash`, `.rustup`
   - other volumes
 
@@ -85,6 +92,7 @@ Incremental-compilation directories follow their crate's units.
 - The first run walks it.
 - After that, before each sweep, it replays the macOS file events journal from where it left off. It checks only the directories that changed. A build writes into its target, so every new target shows up.
 - If the journal lost track of a folder, it walks that folder. It walks everything again only when macOS reset the journal, or the daemon was off for over a week.
+- Linux keeps no such journal, so it walks the home directory again every 6 hours. It lists each directory once and looks closer only where a marker below is. A home directory of 2.5 million directories takes about 10 seconds when the system has their metadata cached.
 - `cendrillon scan` walks it now.
 
 ### What it recognizes
@@ -93,7 +101,7 @@ Anything recognized may be deleted, so it is picky:
 - **Disk cache:** only two-hex-digit shard directories under `ac/` and `cas/`.
 - **Install base:** sits in an `install/` directory and contains `build-label.txt`.
 - **Cargo target:** contains `.rustc_info.json` and a profile directory with `.fingerprint/` and `deps/`.
-- **Deleted workspace:** its parent directory still exists, and it is not on an unmounted volume under `/Volumes`. Unplugging a drive is not a deletion.
+- **Deleted workspace:** its parent directory still exists, and it is not on an unmounted volume: under `/Volumes` on macOS; under `/media`, `/run/media`, `/mnt` or a mount point in `/etc/fstab` on Linux. Unplugging a drive is not a deletion.
 
 ## Safety
 - **Output bases:** takes the lock every Bazel command holds on `<output_base>/lock`, so it never deletes a base in use. Stops the matching Bazel server. Renames the base to a hidden `.cendrillon-trash-*` sibling, then deletes it. Bazel never sees half a base.
@@ -105,7 +113,7 @@ Anything recognized may be deleted, so it is picky:
 - **Interrupted deletions:** finished on the next pass.
 
 ## Configuration
-`~/.config/cendrillon/config.toml`. Every key is optional. Durations use [humantime](https://docs.rs/humantime) syntax. The defaults:
+`~/.config/cendrillon/config.toml`. Every key is optional. Where cendrillon remembers what it found: `~/Library/Application Support/cendrillon/state.json` on macOS, `~/.local/state/cendrillon/state.json` on Linux. Durations use [humantime](https://docs.rs/humantime) syntax. The defaults:
 
 ```toml
 dry_run = false               # log what would be deleted instead of deleting it

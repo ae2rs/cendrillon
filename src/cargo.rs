@@ -11,6 +11,12 @@
 //! build, and macOS records a read in the access time while that time is older than the
 //! modification time. [`record_reads`] notes the units read since its last call, then sets
 //! their access times back just before their modification times, so the next read shows too.
+//! Linux does the same with the default `relatime` mount option, but records no read at all
+//! with `noatime`, so there the daemon also watches the hash files being opened (see
+//! `inotify.rs`) and passes what it saw to [`record_reads`].
+//!
+//! Since opening a hash file looks like a read to that watcher, cendrillon remembers their
+//! contents in the read log and opens one again only after Cargo rewrote it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, FileTimes};
@@ -20,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+
+use crate::sys;
 
 /// When cendrillon saw Cargo read each unit. It lives in the target, so it goes with it.
 const READ_LOG: &str = ".cendrillon-reads.json";
@@ -97,15 +105,40 @@ pub fn profiles(target: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The unit directories of a profile: `<profile>/.fingerprint/<package>-<hash>`.
+#[cfg(target_os = "linux")]
+pub fn unit_dirs(profile: &Path) -> Vec<PathBuf> {
+    real_subdirs(&profile.join(".fingerprint"))
+}
+
+/// How the read log names a unit directory: relative to its target.
+#[cfg(target_os = "linux")]
+pub fn unit_key(target: &Path, unit: &Path) -> String {
+    ReadLog::key(target, unit)
+}
+
+/// Whether a file in a unit directory is a hash file, `<role>`, rather than its `<role>.json`,
+/// its dep-info `dep-<role>` or its saved output `output-<role>`.
+#[cfg(target_os = "linux")]
+pub fn is_hash_file_name(name: &str) -> bool {
+    !name.ends_with(".json") && ROLE_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
 fn is_profile(dir: &Path) -> bool {
     is_dir(&dir.join(".fingerprint")) && is_dir(&dir.join("deps"))
 }
 
-/// Notes which units Cargo read since the last call, and sets their hash files up to show the
-/// next read. Only access times change: Cargo goes by contents and modification times.
-pub fn record_reads(target: &Path) -> io::Result<()> {
+/// Reads of hash files seen as they happened rather than in access times: by unit directory
+/// relative to the target, as in the read log, the latest one.
+pub type Observed = HashMap<String, SystemTime>;
+
+/// Notes which units Cargo read since the last call, from access times and from `observed`,
+/// and sets their hash files up to show the next read. Only access times change: Cargo goes
+/// by contents and modification times.
+pub fn record_reads(target: &Path, observed: &Observed) -> io::Result<()> {
     let mut log = ReadLog::load(target)?;
     let mut present = HashSet::new();
+    let mut hashes = HashSet::new();
     let mut to_arm = Vec::new();
     for profile in profiles(target) {
         for unit in real_subdirs(&profile.join(".fingerprint")) {
@@ -116,14 +149,20 @@ pub fn record_reads(target: &Path) -> io::Result<()> {
                 if accessed > modified {
                     log.record(&key, accessed);
                 }
+                log.remember_hash(target, &hash_file, modified, accessed);
+                hashes.insert(ReadLog::key(target, &hash_file));
                 if accessed >= modified {
                     to_arm.push((hash_file, modified));
                 }
+            }
+            if let Some(&read) = observed.get(&key) {
+                log.record(&key, read);
             }
             present.insert(key);
         }
     }
     log.units.retain(|key, _| present.contains(key));
+    log.hashes.retain(|key, _| hashes.contains(key));
     // Saved before any access time is reset, so a failure below loses no read.
     log.save(target)?;
     for (hash_file, modified) in to_arm {
@@ -131,10 +170,27 @@ pub fn record_reads(target: &Path) -> io::Result<()> {
             .checked_sub(Duration::from_secs(1))
             .unwrap_or(SystemTime::UNIX_EPOCH);
         // A file that cannot be armed (built by root, say) only stops showing reads.
-        let _ = fs::File::open(&hash_file)
-            .and_then(|file| file.set_times(FileTimes::new().set_accessed(armed)));
+        let _ = sys::set_accessed(&hash_file, armed);
     }
     Ok(())
+}
+
+/// Remembers the contents of every hash file in `target`, as [`record_reads`] does, but
+/// changes nothing else: for a dry run, whose reads would otherwise look like Cargo's.
+pub fn remember_hashes(target: &Path) -> io::Result<()> {
+    let mut log = ReadLog::load(target)?;
+    let mut hashes = HashSet::new();
+    for profile in profiles(target) {
+        for unit in real_subdirs(&profile.join(".fingerprint")) {
+            for hash_file in hash_files(&unit) {
+                let meta = fs::symlink_metadata(&hash_file)?;
+                log.remember_hash(target, &hash_file, meta.modified()?, meta.accessed()?);
+                hashes.insert(ReadLog::key(target, &hash_file));
+            }
+        }
+    }
+    log.hashes.retain(|key, _| hashes.contains(key));
+    log.save(target)
 }
 
 /// The fingerprint hash file of each role of a unit: `<role>` next to `<role>.json`.
@@ -153,6 +209,28 @@ fn hash_files(unit: &Path) -> Vec<PathBuf> {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ReadLog {
     units: BTreeMap<String, u64>,
+    /// Per hash file, relative to the target, its contents as of a modification time.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hashes: BTreeMap<String, CachedHash>,
+}
+
+/// A hash file's contents, and its modification time then, in seconds and nanoseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedHash(u64, u32, String);
+
+impl CachedHash {
+    fn new(modified: SystemTime, hash: String) -> Self {
+        let since = modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        Self(since.as_secs(), since.subsec_nanos(), hash)
+    }
+
+    /// The contents, if the file was not rewritten since.
+    fn get(&self, modified: SystemTime) -> Option<&str> {
+        let current = Self::new(modified, String::new());
+        ((self.0, self.1) == (current.0, current.1)).then_some(self.2.as_str())
+    }
 }
 
 impl ReadLog {
@@ -193,6 +271,28 @@ impl ReadLog {
         *entry = (*entry).max(secs);
     }
 
+    /// Reads `hash_file` into the log, unless the log has it as of `modified`. A file that
+    /// cannot be read is left out: the trim fails on it later.
+    fn remember_hash(
+        &mut self,
+        target: &Path,
+        hash_file: &Path,
+        modified: SystemTime,
+        accessed: SystemTime,
+    ) {
+        let key = Self::key(target, hash_file);
+        if self
+            .hashes
+            .get(&key)
+            .is_some_and(|cached| cached.get(modified).is_some())
+        {
+            return;
+        }
+        if let Ok(hash) = read_quietly(hash_file, accessed) {
+            self.hashes.insert(key, CachedHash::new(modified, hash));
+        }
+    }
+
     fn get(&self, key: &str) -> Option<SystemTime> {
         let secs = *self.units.get(key)?;
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
@@ -215,18 +315,24 @@ pub struct Garbage {
 }
 
 /// Finds the garbage in `target`: units neither used within `unit_idle` of `now`, nor the
-/// newest generation of a top-level unit, nor needed by one of those.
+/// newest generation of a top-level unit, nor needed by one of those. Reads in `observed`
+/// count as well as those in the read log.
 ///
 /// Reads fingerprint files and the first bytes of uplifted outputs, and lists directories;
 /// writes nothing. Fails rather than guess when a unit cannot be read, since what it depends
 /// on is unknown.
-pub fn garbage(target: &Path, unit_idle: Duration, now: SystemTime) -> io::Result<Garbage> {
+pub fn garbage(
+    target: &Path,
+    unit_idle: Duration,
+    now: SystemTime,
+    observed: &Observed,
+) -> io::Result<Garbage> {
     let recent = now.checked_sub(unit_idle).unwrap_or(SystemTime::UNIX_EPOCH);
     let profiles = profiles(target);
     let log = ReadLog::load(target)?;
     let mut graph = Graph::default();
     for (index, profile) in profiles.iter().enumerate() {
-        graph.load(index, profile, |unit| log.get(&ReadLog::key(target, unit)))?;
+        graph.load(index, profile, target, &log, observed)?;
     }
     let unreadable = graph.dirs.iter().filter(|dir| dir.unknown).count();
     if unreadable > 0 {
@@ -394,12 +500,15 @@ struct Graph {
 }
 
 impl Graph {
-    /// Loads a profile's units; `logged` gives the last read recorded for a unit directory.
+    /// Loads a profile's units, with the reads and hash file contents `log` has for them, and
+    /// the reads in `observed`.
     fn load(
         &mut self,
         profile_index: usize,
         profile: &Path,
-        logged: impl Fn(&Path) -> Option<SystemTime>,
+        target: &Path,
+        log: &ReadLog,
+        observed: &Observed,
     ) -> io::Result<()> {
         for entry in fs::read_dir(profile.join(".fingerprint"))? {
             let entry = entry?;
@@ -410,7 +519,8 @@ impl Graph {
                 continue;
             }
             let dir = self.dirs.len();
-            let logged = logged(&entry.path());
+            let key = ReadLog::key(target, &entry.path());
+            let logged = log.get(&key).max(observed.get(&key).copied());
             let mut unit = UnitDir {
                 profile: profile_index,
                 name,
@@ -425,7 +535,9 @@ impl Graph {
                 else {
                     continue;
                 };
-                match read_node(&file, &entry.path().join(role), role, dir, logged) {
+                let hash_file = entry.path().join(role);
+                let cached = log.hashes.get(&ReadLog::key(target, &hash_file));
+                match read_node(&file, &hash_file, role, dir, logged, cached) {
                     Some(node) => {
                         unit.nodes.push(self.nodes.len());
                         self.nodes.push(node);
@@ -572,9 +684,10 @@ fn read_node(
     role: &str,
     dir: usize,
     logged: Option<SystemTime>,
+    cached: Option<&CachedHash>,
 ) -> Option<Node> {
     let parsed: FingerprintJson = serde_json::from_slice(&fs::read(json).ok()?).ok()?;
-    let (hash, compiled, accessed) = read_hash_file(hash_file).ok()?;
+    let (hash, compiled, accessed) = read_hash_file(hash_file, cached).ok()?;
     let fingerprint = match hash.trim() {
         "" => None,
         hex => Some(u64::from_le_bytes(decode_hex(hex)?.try_into().ok()?)),
@@ -603,20 +716,32 @@ fn read_node(
     })
 }
 
-/// A hash file's contents, modification time and access time. Reading moves the access time,
-/// which is how cendrillon tells that Cargo read the file, so it is put back.
-fn read_hash_file(path: &Path) -> io::Result<(String, SystemTime, SystemTime)> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let meta = file.metadata()?;
+/// A hash file's contents, modification time and access time. The contents come from
+/// `cached` when Cargo has not rewritten the file since, so that the file is not opened.
+fn read_hash_file(
+    path: &Path,
+    cached: Option<&CachedHash>,
+) -> io::Result<(String, SystemTime, SystemTime)> {
+    let meta = fs::symlink_metadata(path)?;
     let (modified, accessed) = (meta.modified()?, meta.accessed()?);
-    let mut hash = String::new();
-    file.read_to_string(&mut hash)?;
-    // macOS only moves the access time while it is older than the modification time.
-    if accessed < modified {
+    let hash = match cached.and_then(|cached| cached.get(modified)) {
+        Some(hash) => hash.to_owned(),
+        None => read_quietly(path, accessed)?,
+    };
+    Ok((hash, modified, accessed))
+}
+
+/// A file's contents. Reading may move the access time, which is how cendrillon tells that
+/// Cargo read the file, so it is put back to `accessed`.
+fn read_quietly(path: &Path, accessed: SystemTime) -> io::Result<String> {
+    use std::io::Read;
+    let mut file = sys::open_quietly(path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    if file.metadata()?.accessed()? != accessed {
         file.set_times(FileTimes::new().set_accessed(accessed))?;
     }
-    Ok((hash, modified, accessed))
+    Ok(text)
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -842,6 +967,27 @@ mod tests {
         }
     }
 
+    /// Whether the file system holding `dir` records reads in access times, which Linux does
+    /// not when mounted `noatime`.
+    fn records_reads(dir: &Path) -> bool {
+        let probe = dir.join("atime-probe");
+        fs::write(&probe, "probe").unwrap();
+        let modified = mtime(&probe).unwrap();
+        let before = filetime::FileTime::from_system_time(modified - Duration::from_secs(10));
+        filetime::set_file_atime(&probe, before).unwrap();
+        fs::read(&probe).unwrap();
+        let meta = fs::metadata(&probe).unwrap();
+        fs::remove_file(&probe).unwrap();
+        let recorded = meta.accessed().unwrap() > meta.modified().unwrap();
+        if !recorded {
+            eprintln!(
+                "skipped: {} records no reads in access times",
+                dir.display()
+            );
+        }
+        recorded
+    }
+
     /// Makes every unit look compiled `age` ago.
     fn backdate(units: &[PathBuf], age: Duration) {
         let time = filetime::FileTime::from_system_time(SystemTime::now() - age);
@@ -877,7 +1023,7 @@ mod tests {
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
         ws.cargo("check");
-        let none = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
+        let none = garbage(&ws.target(), Duration::ZERO, later(), &Observed::new()).unwrap();
         assert_eq!(none, Garbage::default());
 
         ws.enable_extra();
@@ -886,11 +1032,11 @@ mod tests {
         assert_eq!(ws.units().len(), 8);
 
         // Everything was compiled just now.
-        let recent = garbage(&ws.target(), DAY, SystemTime::now()).unwrap();
+        let recent = garbage(&ws.target(), DAY, SystemTime::now(), &Observed::new()).unwrap();
         assert_eq!(recent.units, 0);
 
         // Past `unit_idle`, the first build's and the first check's app and dep go.
-        let found = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
+        let found = garbage(&ws.target(), Duration::ZERO, later(), &Observed::new()).unwrap();
         assert_eq!(found.units, 4, "{found:#?}");
         assert_eq!(found.incremental_dirs, 4, "{found:#?}");
         let debug = ws.target().join("debug");
@@ -906,6 +1052,9 @@ mod tests {
     #[test]
     fn an_older_generation_cargo_still_reads_stays() {
         let dir = tempfile::tempdir().unwrap();
+        if !records_reads(dir.path()) {
+            return;
+        }
         let ws = Workspace::new(dir.path());
         ws.cargo("check");
         let first = ws.units();
@@ -919,11 +1068,13 @@ mod tests {
         ws.disable_extra();
         backdate(&first, 3 * DAY);
         backdate(&second, 2 * DAY);
-        record_reads(&ws.target()).unwrap();
+        record_reads(&ws.target(), &Observed::new()).unwrap();
 
         // Nobody read the first generation since it was compiled three days ago.
         assert_eq!(
-            garbage(&ws.target(), DAY, SystemTime::now()).unwrap().units,
+            garbage(&ws.target(), DAY, SystemTime::now(), &Observed::new())
+                .unwrap()
+                .units,
             2
         );
 
@@ -931,10 +1082,13 @@ mod tests {
         // generation is the one nobody used for two days.
         let check = ws.cargo("check");
         assert!(!check.contains("Checking"), "{check}");
-        for found in [garbage(&ws.target(), DAY, SystemTime::now()).unwrap(), {
-            record_reads(&ws.target()).unwrap();
-            garbage(&ws.target(), DAY, SystemTime::now()).unwrap()
-        }] {
+        for found in [
+            garbage(&ws.target(), DAY, SystemTime::now(), &Observed::new()).unwrap(),
+            {
+                record_reads(&ws.target(), &Observed::new()).unwrap();
+                garbage(&ws.target(), DAY, SystemTime::now(), &Observed::new()).unwrap()
+            },
+        ] {
             assert_eq!(found.units, 2, "{found:#?}");
             let unit_paths: Vec<_> = found
                 .paths
@@ -962,6 +1116,9 @@ mod tests {
     #[test]
     fn record_reads_sets_hash_files_up_to_show_the_next_read() {
         let dir = tempfile::tempdir().unwrap();
+        if !records_reads(dir.path()) {
+            return;
+        }
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
         let read_since_armed = || -> usize {
@@ -974,7 +1131,7 @@ mod tests {
                 })
                 .count()
         };
-        record_reads(&ws.target()).unwrap();
+        record_reads(&ws.target(), &Observed::new()).unwrap();
         let mtimes: Vec<_> = ws
             .units()
             .iter()
@@ -985,7 +1142,7 @@ mod tests {
 
         ws.cargo("build");
         assert_eq!(read_since_armed(), 2);
-        record_reads(&ws.target()).unwrap();
+        record_reads(&ws.target(), &Observed::new()).unwrap();
         assert_eq!(read_since_armed(), 0);
         assert_eq!(ReadLog::load(&ws.target()).unwrap().units.len(), 2);
         let after: Vec<_> = ws
@@ -995,6 +1152,68 @@ mod tests {
             .map(|f| mtime(&f))
             .collect();
         assert_eq!(mtimes, after, "modification times must not change");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_older_generation_cargo_still_reads_stays_when_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        let target = ws.target();
+        ws.cargo("check");
+        let first = ws.units();
+        ws.enable_extra();
+        ws.cargo("check");
+        let second: Vec<PathBuf> = ws
+            .units()
+            .into_iter()
+            .filter(|unit| !first.contains(unit))
+            .collect();
+        ws.disable_extra();
+        backdate(&first, 3 * DAY);
+        backdate(&second, 2 * DAY);
+        // Remembers every hash file, so cendrillon opens none from now on.
+        record_reads(&target, &Observed::new()).unwrap();
+        let reads = crate::inotify::Reads::start().unwrap();
+        reads.watch([target.as_path()]);
+
+        let found = garbage(&target, DAY, SystemTime::now(), &Observed::new()).unwrap();
+        assert_eq!(found.units, 2, "{found:#?}");
+        assert!(reads.observed(&target).is_empty());
+
+        // A Fresh check reads the first generation: now the second is the one nobody used.
+        let check = ws.cargo("check");
+        assert!(!check.contains("Checking"), "{check}");
+        let keys = |units: &[PathBuf]| -> HashSet<String> {
+            units.iter().map(|unit| unit_key(&target, unit)).collect()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !keys(&first)
+            .iter()
+            .all(|key| reads.observed(&target).contains_key(key))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reads went unseen"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        record_reads(&target, &reads.observed(&target)).unwrap();
+        let found = garbage(&target, DAY, SystemTime::now(), &Observed::new()).unwrap();
+        assert_eq!(found.units, 2, "{found:#?}");
+        assert!(
+            found
+                .paths
+                .iter()
+                .filter(|path| path
+                    .parent()
+                    .is_some_and(|dir| dir.ends_with(".fingerprint")))
+                .all(|path| second.contains(path)),
+            "{found:#?}"
+        );
+        // cendrillon's own reads, of the remembered hash files, went unseen.
+        let seen: HashSet<String> = reads.observed(&target).into_keys().collect();
+        assert!(seen.is_disjoint(&keys(&second)), "{seen:?}");
     }
 
     #[test]
@@ -1015,7 +1234,7 @@ mod tests {
         }
 
         // The second build compiled last, but the uplifted `app` is the first one's.
-        let found = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
+        let found = garbage(&ws.target(), Duration::ZERO, later(), &Observed::new()).unwrap();
         assert_eq!(found.units, 0, "{found:#?}");
     }
 
@@ -1036,7 +1255,7 @@ mod tests {
             std::os::unix::fs::symlink(&outside, debug.join(sub)).unwrap();
         }
 
-        let found = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
+        let found = garbage(&ws.target(), Duration::ZERO, later(), &Observed::new()).unwrap();
         assert!(found.units > 0);
         let outside = fs::canonicalize(&outside).unwrap();
         for path in &found.paths {
@@ -1057,7 +1276,7 @@ mod tests {
                 fs::write(&file, "not json").unwrap();
             }
         }
-        assert!(garbage(&ws.target(), Duration::ZERO, later()).is_err());
+        assert!(garbage(&ws.target(), Duration::ZERO, later(), &Observed::new()).is_err());
     }
 
     #[test]
@@ -1066,8 +1285,8 @@ mod tests {
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
         fs::write(ws.target().join(READ_LOG), "{").unwrap();
-        assert!(record_reads(&ws.target()).is_err());
-        assert!(garbage(&ws.target(), Duration::ZERO, later()).is_err());
+        assert!(record_reads(&ws.target(), &Observed::new()).is_err());
+        assert!(garbage(&ws.target(), Duration::ZERO, later(), &Observed::new()).is_err());
         let target = Target::classify(&ws.target()).unwrap();
         assert!(target.last_used.elapsed().unwrap_or_default() < Duration::from_secs(60));
     }

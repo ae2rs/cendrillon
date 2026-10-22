@@ -2,17 +2,16 @@
 name = "cendrillon"
 version = "0.2.2"
 edition = "2024"
-description = "A macOS background daemon that deletes unused Bazel caches and Cargo build output"
+description = "A macOS and Linux background daemon that deletes unused Bazel caches and Cargo build output"
 license = "MIT"
 repository = "https://github.com/ae2rs/cendrillon"
 readme = "README.md"
-keywords = ["bazel", "cargo", "cache", "macos", "disk"]
+keywords = ["bazel", "cargo", "cache", "macos", "linux"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-core-foundation-sys = "0.8.7"
 humantime = "2.4.0"
 humantime-serde = "1.1.1"
 nix = { version = "0.31.3", features = ["fs", "signal", "process", "user"] }
@@ -23,6 +22,12 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 walkdir = "2.5.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", features = ["inotify"] }
 
 [dev-dependencies]
 filetime = "0.2.29"

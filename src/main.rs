@@ -4,11 +4,22 @@ mod daemon;
 mod discovery;
 mod env;
 mod executor;
+#[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(target_os = "linux")]
+mod inotify;
 mod inventory;
+#[cfg(target_os = "macos")]
 mod launchd;
 mod planner;
 mod sys;
+#[cfg(target_os = "linux")]
+mod systemd;
+
+#[cfg(target_os = "macos")]
+use launchd as service;
+#[cfg(target_os = "linux")]
+use systemd as service;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -57,11 +68,11 @@ enum Command {
     },
     /// Walk the whole home directory for caches and targets now, rather than follow its changes.
     Scan,
-    /// Clean continuously in the foreground; this is what launchd runs.
+    /// Clean continuously in the foreground; this is what launchd or systemd runs.
     Daemon,
-    /// Start the daemon now and at every login, as a launchd agent.
+    /// Start the daemon now and at every login, as a launchd agent or a systemd user service.
     Install,
-    /// Stop the daemon and remove the launchd agent.
+    /// Stop the daemon and remove the launchd agent or systemd user service.
     Uninstall,
 }
 
@@ -109,8 +120,8 @@ fn main() -> Result<()> {
             discovery::HomeSearch::Walk,
         ),
         Command::Daemon => daemon::run(&env, &config),
-        Command::Install => launchd::install(&env),
-        Command::Uninstall => launchd::uninstall(&env),
+        Command::Install => service::install(&env),
+        Command::Uninstall => service::uninstall(&env),
     }
 }
 
@@ -119,7 +130,13 @@ fn executor<'a>(config: &Config, dry_run: bool, stop: &'a AtomicBool) -> Executo
         dry_run: dry_run || config.dry_run,
         stop,
         unit_idle: config.unit_idle,
+        observed: &no_observed_reads,
     }
+}
+
+/// Only the daemon watches reads as they happen.
+fn no_observed_reads(_: &std::path::Path) -> cargo::Observed {
+    cargo::Observed::new()
 }
 
 fn report(dry_run: bool, freed: u64) {

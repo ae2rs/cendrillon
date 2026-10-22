@@ -3,8 +3,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, FileType};
 use std::io;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::cargo::{self, Target};
@@ -75,6 +78,17 @@ pub enum CacheKind {
     /// The `contents/` repo contents cache is left to Bazel's own GC.
     Repository,
 }
+
+/// Entries one of which every directory [`classify`] recognizes holds, trash aside: an output
+/// base's `DO_NOT_BUILD_HERE`, an install base's `build-label.txt`, a Cargo target's
+/// `.rustc_info.json`, a disk cache's `ac/`, a repository cache's `content_addressable/`.
+pub const MARKERS: [&str; 5] = [
+    "DO_NOT_BUILD_HERE",
+    "build-label.txt",
+    ".rustc_info.json",
+    "ac",
+    "content_addressable",
+];
 
 /// Recognizes a directory Bazel or Cargo manages from the markers they leave in it. The checks
 /// are strict, because whatever matches under the home directory may be deleted.
@@ -167,6 +181,7 @@ impl Workspace {
 }
 
 /// False when `path` lies on a volume under `/Volumes` that is not mounted right now.
+#[cfg(target_os = "macos")]
 fn volume_mounted(path: &Path) -> bool {
     let mut components = path.components();
     let (Some(Component::RootDir), Some(Component::Normal(top)), Some(Component::Normal(name))) =
@@ -182,6 +197,76 @@ fn volume_mounted(path: &Path) -> bool {
         (Ok(parent), Ok(volume)) => parent.dev() != volume.dev(),
         _ => false,
     }
+}
+
+/// False when `path` lies where a volume is mounted but none is right now: a mount point
+/// listed in `/etc/fstab`, or under `/media`, `/run/media` or `/mnt`, where removable drives
+/// go. An unmounted drive often leaves its empty mount point behind, so the parent of a
+/// workspace on it still exists.
+#[cfg(target_os = "linux")]
+fn volume_mounted(path: &Path) -> bool {
+    let mounted = mount_points(
+        &fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(),
+        4,
+    );
+    let listed = mount_points(&fs::read_to_string("/etc/fstab").unwrap_or_default(), 1);
+    is_reachable(path, &mounted, &listed)
+}
+
+#[cfg(target_os = "linux")]
+fn is_reachable(path: &Path, mounted: &HashSet<PathBuf>, listed: &HashSet<PathBuf>) -> bool {
+    let fstab_ok = listed
+        .iter()
+        .filter(|point| point.as_path() != Path::new("/") && path.starts_with(point))
+        .all(|point| mounted.contains(point));
+    let removable_ok = ["/media", "/run/media", "/mnt"]
+        .iter()
+        .find(|prefix| path.starts_with(prefix))
+        .is_none_or(|prefix| {
+            path.ancestors()
+                .take_while(|ancestor| *ancestor != Path::new(prefix))
+                .any(|ancestor| mounted.contains(ancestor))
+        });
+    fstab_ok && removable_ok
+}
+
+/// The absolute paths in column `column` of a mount table (`fstab`, `mountinfo`), which
+/// writes spaces and other special characters as octal escapes.
+#[cfg(target_os = "linux")]
+fn mount_points(table: &str, column: usize) -> HashSet<PathBuf> {
+    table
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.split_whitespace().nth(column))
+        .filter(|point| point.starts_with('/'))
+        .map(|point| {
+            use std::os::unix::ffi::OsStringExt;
+            let bytes = point.as_bytes();
+            let mut decoded = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                let octal = bytes
+                    .get(i + 1..i + 4)
+                    .filter(|digits| {
+                        bytes[i] == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d))
+                    })
+                    .and_then(|digits| {
+                        u8::from_str_radix(std::str::from_utf8(digits).ok()?, 8).ok()
+                    });
+                match octal {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        i += 4;
+                    }
+                    None => {
+                        decoded.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            PathBuf::from(std::ffi::OsString::from_vec(decoded))
+        })
+        .collect()
 }
 
 fn is_hex(name: &str, len: usize) -> bool {
@@ -274,9 +359,12 @@ impl Usage {
                     size
                 }
                 Item::CargoTarget(target) => {
-                    if let Ok(garbage) =
-                        cargo::garbage(&target.root, cargo_unit_idle, SystemTime::now())
-                    {
+                    if let Ok(garbage) = cargo::garbage(
+                        &target.root,
+                        cargo_unit_idle,
+                        SystemTime::now(),
+                        &cargo::Observed::new(),
+                    ) {
                         let bytes = garbage.paths.iter().map(|path| sys::unshared_size(path));
                         usage.garbage.insert(path.clone(), bytes.sum());
                     }
@@ -468,9 +556,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn workspace_on_unmounted_volume_is_unreachable() {
         let path = PathBuf::from("/Volumes/cendrillon-not-mounted/repo");
         assert_eq!(Workspace::check(path.clone()), Workspace::Unreachable(path));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_where_no_volume_is_mounted_is_unreachable() {
+        let mounted = mount_points(
+            "22 1 0:21 / / rw - xfs /dev/dm-0 rw\n\
+             40 22 8:17 / /run/media/me/My\\040Drive rw - ext4 /dev/sdb1 rw\n\
+             41 22 8:33 / /data rw - ext4 /dev/sdc1 rw\n",
+            4,
+        );
+        let listed = mount_points(
+            "# <file system> <dir> <type>\n\
+             UUID=1 / xfs defaults 0 1\n\
+             UUID=2 /data ext4 defaults 0 2\n\
+             UUID=3 /backup ext4 noauto 0 2\n\
+             UUID=4 none swap sw 0 0\n",
+            1,
+        );
+        let reachable = |path: &str| is_reachable(Path::new(path), &mounted, &listed);
+        assert!(reachable("/home/me/repo"));
+        assert!(reachable("/data/repo"));
+        assert!(reachable("/run/media/me/My Drive/repo"));
+        assert!(!reachable("/run/media/me/Other/repo"));
+        assert!(!reachable("/mnt/usb/repo"));
+        assert!(!reachable("/media/usb/repo"));
+        assert!(!reachable("/backup/repo"));
     }
 
     #[test]
