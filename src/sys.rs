@@ -177,6 +177,179 @@ pub fn command_lines() -> Vec<String> {
         .collect()
 }
 
+/// Paths other processes are using: their working directory, root directory, executable and
+/// open files, with mapped files on Linux. Only processes this user may inspect are seen,
+/// which is every process of their own.
+pub fn open_paths() -> Vec<(Pid, PathBuf)> {
+    let own = std::process::id() as i32;
+    let mut found = Vec::new();
+    for pid in all_pids().into_iter().filter(|&pid| pid != own) {
+        found.extend(
+            paths_of(pid)
+                .into_iter()
+                .filter(|path| path.is_absolute())
+                .map(|path| (Pid::from_raw(pid), path)),
+        );
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn all_pids() -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+/// Read from `/proc`. A file deleted while open reads `<path> (deleted)`, which still names
+/// the directory it was in.
+#[cfg(target_os = "linux")]
+fn paths_of(pid: i32) -> Vec<PathBuf> {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let mut paths: Vec<PathBuf> = ["cwd", "root", "exe"]
+        .iter()
+        .filter_map(|link| std::fs::read_link(proc.join(link)).ok())
+        .collect();
+    paths.extend(
+        std::fs::read_dir(proc.join("fd"))
+            .into_iter()
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok()),
+    );
+    // Shared libraries stay mapped after their file is closed.
+    let maps = std::fs::read_to_string(proc.join("maps")).unwrap_or_default();
+    let mut mapped: Vec<PathBuf> = maps
+        .lines()
+        .filter_map(|line| line.splitn(6, ' ').nth(5))
+        .map(str::trim_start)
+        .filter(|path| path.starts_with('/'))
+        .map(PathBuf::from)
+        .collect();
+    mapped.dedup();
+    paths.extend(mapped);
+    paths
+}
+
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<i32> {
+    // SAFETY: called with a null buffer, it returns how many pids there are; then fills at
+    // most the buffer's size and returns how many it wrote.
+    unsafe {
+        let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+        let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        let count = libc::proc_listallpids(pids.as_mut_ptr().cast(), size);
+        pids.truncate(count.max(0) as usize);
+        pids
+    }
+}
+
+/// `struct proc_fileinfo` of `<sys/proc_info.h>`, which `libc` lacks.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: libc::off_t,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+/// `struct vnode_fdinfowithpath`, what `PROC_PIDFDVNODEPATHINFO` returns.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    pfi: ProcFileInfo,
+    pvip: libc::vnode_info_path,
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+// `PROC_PIDFDVNODEPATHINFO_SIZE`: the call fails on any other size.
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<VnodeFdInfoWithPath>() == 1200);
+
+/// Read through libproc, as `lsof` does.
+#[cfg(target_os = "macos")]
+fn paths_of(pid: i32) -> Vec<PathBuf> {
+    use std::mem::{size_of, zeroed};
+    use std::os::unix::ffi::OsStrExt;
+    fn path(raw: &[[libc::c_char; 32]; 32]) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes: Vec<u8> = raw
+            .iter()
+            .flatten()
+            .map(|&c| c as u8)
+            .take_while(|&b| b != 0)
+            .collect();
+        (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    let mut paths = Vec::new();
+    // SAFETY: each call is given a buffer of the size it is told, of the type the flavor
+    // fills, and its result is only read when the call filled it whole.
+    unsafe {
+        let mut dirs: libc::proc_vnodepathinfo = zeroed();
+        let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        let filled = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut dirs).cast(),
+            size,
+        );
+        if filled == size {
+            paths.extend(path(&dirs.pvi_cdir.vip_path));
+            paths.extend(path(&dirs.pvi_rdir.vip_path));
+        }
+
+        let mut exe = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let len = libc::proc_pidpath(pid, exe.as_mut_ptr().cast(), exe.len() as u32);
+        if len > 0 {
+            exe.truncate(len as usize);
+            paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(&exe)));
+        }
+
+        let fd_size = size_of::<libc::proc_fdinfo>();
+        let bytes = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
+        if bytes <= 0 {
+            return paths;
+        }
+        let mut fds: Vec<libc::proc_fdinfo> = vec![zeroed(); bytes as usize / fd_size + 32];
+        let bytes = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            (fds.len() * fd_size) as libc::c_int,
+        );
+        fds.truncate(bytes.max(0) as usize / fd_size);
+        for fd in fds {
+            if fd.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+                continue;
+            }
+            let mut info: VnodeFdInfoWithPath = zeroed();
+            let size = size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+            let filled = libc::proc_pidfdinfo(
+                pid,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                (&raw mut info).cast(),
+                size,
+            );
+            if filled == size {
+                paths.extend(path(&info.pvip.vip_path));
+            }
+        }
+    }
+    paths
+}
+
 /// Sets a file's access time, leaving its modification time alone.
 #[cfg(target_os = "macos")]
 pub fn set_accessed(path: &Path, time: SystemTime) -> io::Result<()> {
@@ -435,6 +608,24 @@ mod tests {
         };
         assert_eq!(disk.shortfall(25), 0);
         assert_eq!(disk.shortfall(40), 10);
+    }
+
+    #[test]
+    fn sees_a_process_working_in_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        let seen = open_paths()
+            .iter()
+            .any(|(owner, path)| *owner == pid && path.starts_with(&dir));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(seen);
     }
 
     #[test]

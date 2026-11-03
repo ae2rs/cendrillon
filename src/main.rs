@@ -6,6 +6,7 @@ mod env;
 mod executor;
 #[cfg(target_os = "macos")]
 mod fsevents;
+mod git;
 #[cfg(target_os = "linux")]
 mod inotify;
 mod inventory;
