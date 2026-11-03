@@ -39,7 +39,7 @@ cendrillon worktrees              # git worktrees found, and which would be remo
 | Install base (an extracted Bazel version) unused for 72h | Hourly sweep |
 | Cargo build units nothing current depends on | Hourly sweep |
 | Cargo target directory unused for 7 days | Hourly sweep |
-| Git worktree, clean and unused for 7 days, or 1 day once merged (opt-in) | Hourly sweep |
+| Git worktree, clean and unused for 7 days; 1 day once merged; 30 days while pushed and not merged (opt-in) | Hourly sweep |
 
 Everything it deletes can be rebuilt or downloaded again. A worktree it removes holds nothing the repository does not keep.
 
@@ -89,6 +89,7 @@ It removes a linked worktree, never the main one, when all of these hold:
 - It holds no other git checkout.
 - `exclude` does not name it.
 - Nothing happened in it for `idle` (7 days), or `idle_when_merged` (1 day) once its branch is finished: its upstream branch was deleted, or HEAD is in the default branch (`origin/HEAD`, else `origin/main` or `origin/master`, else the local `main` or `master` when there is no remote).
+- While its branch is not finished but is still on a remote, typically an open pull request, it waits `idle_when_pushed` (30 days) instead. The commits are safe either way; this spares re-creating the checkout and rebuilding for a review round. On a remote means its upstream, unless gone, or else a branch of the same name on any remote, as last fetched.
 - What counts: its HEAD, index or HEAD log changing, a file added or removed at its top, a Bazel command in its output base, Cargo using a target in it.
 
 ### How
@@ -167,6 +168,7 @@ extra_roots = []              # more directories to search for caches and target
 enabled = false               # remove the git worktrees nobody uses
 idle = "7d"
 idle_when_merged = "1d"       # once the branch is merged, or its upstream deleted
+idle_when_pushed = "30d"      # while the branch is on a remote and not merged (open PR)
 exclude = []                  # never remove these: path globs (`~/` expands) or directory names
 protect = [".env", ".env.*", ".envrc", "user.bazelrc", "*.local.*"]  # ignored files that keep a worktree
 ```

@@ -102,6 +102,9 @@ pub enum Keep {
     Locked(String),
     /// Last active this long ago, within its deadline.
     Active(Duration),
+    /// Its branch is still on this remote branch, unmerged, and it was last active this long
+    /// ago: past the usual deadline, within the longer one of pushed branches.
+    Pushed(String, Duration),
     Blocked(Blocker),
     /// Removable as far as the cheap facts go; the slower checks did not run.
     Unchecked,
@@ -114,6 +117,7 @@ impl Keep {
             Keep::Excluded => "excluded",
             Keep::Locked(_) => "locked",
             Keep::Active(_) => "active",
+            Keep::Pushed(..) => "pushed, not merged",
             Keep::Blocked(blocker) => blocker.label(),
             Keep::Unchecked => "not checked",
         }
@@ -127,6 +131,9 @@ impl fmt::Display for Keep {
             Keep::Locked(why) if why.is_empty() => f.write_str("locked"),
             Keep::Locked(why) => write!(f, "locked: {why}"),
             Keep::Active(ago) => write!(f, "active {} ago", coarse(*ago)),
+            Keep::Pushed(remote, ago) => {
+                write!(f, "on {remote}, not merged; active {} ago", coarse(*ago))
+            }
             Keep::Blocked(blocker) => blocker.fmt(f),
             Keep::Unchecked => f.write_str("not checked yet"),
         }
@@ -143,7 +150,8 @@ pub fn coarse(duration: Duration) -> String {
 }
 
 /// Whether a worktree goes. Every condition must hold: not excluded, not locked, idle past
-/// its deadline (shorter once its branch is finished), and the slower checks passed: clean,
+/// its deadline (shorter once its branch is finished, longer while it is pushed and not
+/// finished), and the slower checks passed: clean,
 /// no operation under way, no protected ignored file, nothing using it.
 pub fn verdict(worktree: &Worktree, now: SystemTime, config: &WorktreeConfig) -> Verdict {
     if worktree::is_excluded(&worktree.path, &config.exclude) {
@@ -155,12 +163,16 @@ pub fn verdict(worktree: &Worktree, now: SystemTime, config: &WorktreeConfig) ->
     let idle = now
         .duration_since(worktree.last_activity)
         .unwrap_or_default();
-    let deadline = match worktree.done {
-        Some(_) => config.idle_when_merged,
-        None => config.idle,
+    let deadline = match (&worktree.done, &worktree.pushed) {
+        (Some(_), _) => config.idle_when_merged,
+        (None, Some(_)) => config.idle_when_pushed,
+        (None, None) => config.idle,
     };
     if idle < deadline {
-        return Verdict::Keep(Keep::Active(idle));
+        return Verdict::Keep(match (&worktree.done, &worktree.pushed) {
+            (None, Some(remote)) if idle >= config.idle => Keep::Pushed(remote.clone(), idle),
+            _ => Keep::Active(idle),
+        });
     }
     match &worktree.checks {
         Checks::Pending => Verdict::Keep(Keep::Unchecked),
@@ -665,6 +677,7 @@ mod tests {
             locked: None,
             last_activity: now() - idle,
             done,
+            pushed: None,
             output_bases: Vec::new(),
             targets: Vec::new(),
             checks,
@@ -713,6 +726,31 @@ mod tests {
         assert_eq!(
             verdict_of(&locked),
             Verdict::Keep(Keep::Locked("agent at work".into()))
+        );
+
+        let pushed = |idle| Worktree {
+            pushed: Some("origin/pr".into()),
+            ..linked("pr", idle, None, Checks::Passed)
+        };
+        assert_eq!(
+            verdict_of(&pushed(2 * day)),
+            Verdict::Keep(Keep::Active(2 * day))
+        );
+        assert_eq!(
+            verdict_of(&pushed(8 * day)),
+            Verdict::Keep(Keep::Pushed("origin/pr".into(), 8 * day))
+        );
+        assert_eq!(
+            verdict_of(&pushed(31 * day)),
+            Verdict::Reap(Reason::Idle(31 * day))
+        );
+        let merged_and_pushed = Worktree {
+            pushed: Some("origin/merged".into()),
+            ..linked("merged", 2 * day, merged(), Checks::Passed)
+        };
+        assert_eq!(
+            verdict_of(&merged_and_pushed),
+            Verdict::Reap(Reason::Finished(merged().unwrap(), 2 * day))
         );
 
         let excluding = WorktreeConfig {

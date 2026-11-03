@@ -64,6 +64,11 @@ pub struct WorktreeConfig {
     /// branch deleted.
     #[serde(with = "humantime_serde")]
     pub idle_when_merged: Duration,
+    /// Later while its branch is still on a remote and not merged, typically an open pull
+    /// request: the commits are safe there, but the checkout and its build outputs would
+    /// have to be made again for a review round.
+    #[serde(with = "humantime_serde")]
+    pub idle_when_pushed: Duration,
     /// Worktrees never removed: globs on the path (`~/` expands), or on the directory name
     /// when they hold no slash. A pattern matching a parent directory covers what is below.
     pub exclude: Vec<String>,
@@ -78,6 +83,7 @@ impl Default for WorktreeConfig {
             enabled: false,
             idle: 7 * 24 * HOUR,
             idle_when_merged: 24 * HOUR,
+            idle_when_pushed: 30 * 24 * HOUR,
             exclude: Vec::new(),
             protect: [".env", ".env.*", ".envrc", "user.bazelrc", "*.local.*"]
                 .map(String::from)
@@ -149,6 +155,10 @@ impl Config {
                 "worktrees.idle_when_merged",
                 config.worktrees.idle_when_merged,
             ),
+            (
+                "worktrees.idle_when_pushed",
+                config.worktrees.idle_when_pushed,
+            ),
         ];
         for (name, interval) in intervals {
             ensure!(!interval.is_zero(), "{name} must be positive");
@@ -209,6 +219,7 @@ mod tests {
         assert!(!defaults.enabled);
         assert_eq!(defaults.idle, 7 * 24 * HOUR);
         assert_eq!(defaults.idle_when_merged, 24 * HOUR);
+        assert_eq!(defaults.idle_when_pushed, 30 * 24 * HOUR);
         assert!(defaults.protect.contains(&".env".to_string()));
 
         let config = Config::parse(
@@ -216,6 +227,7 @@ mod tests {
             [worktrees]
             enabled = true
             idle = "3d"
+            idle_when_pushed = "14d"
             exclude = ["~/amo/monorepo-keep-*"]
             protect = ["*.pem"]
             "#,
@@ -224,6 +236,7 @@ mod tests {
         assert!(config.worktrees.enabled);
         assert_eq!(config.worktrees.idle, 72 * HOUR);
         assert_eq!(config.worktrees.idle_when_merged, 24 * HOUR);
+        assert_eq!(config.worktrees.idle_when_pushed, 14 * 24 * HOUR);
         assert_eq!(config.worktrees.exclude, ["~/amo/monorepo-keep-*"]);
         assert_eq!(config.worktrees.protect, ["*.pem"]);
         assert_eq!(config.output_base_idle, 24 * HOUR);
@@ -244,6 +257,7 @@ mod tests {
         assert!(Config::parse("[worktrees]\nidle_merged = \"1d\"").is_err());
         assert!(Config::parse("[worktrees]\nidle = \"0s\"").is_err());
         assert!(Config::parse("[worktrees]\nidle_when_merged = \"0s\"").is_err());
+        assert!(Config::parse("[worktrees]\nidle_when_pushed = \"0s\"").is_err());
         assert!(Config::parse("[worktrees]\nexclude = [\"\"]").is_err());
         assert!(Config::parse("worktrees = true").is_err());
     }

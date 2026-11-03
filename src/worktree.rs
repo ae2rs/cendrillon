@@ -202,6 +202,9 @@ pub struct Worktree {
     pub last_activity: SystemTime,
     /// Known only once it is idle for long enough to matter.
     pub done: Option<Done>,
+    /// The remote branch that still holds its unfinished branch, typically that of an open
+    /// pull request. Known only once it is idle for long enough to matter.
+    pub pushed: Option<String>,
     /// Output bases of a Bazel workspace here.
     pub output_bases: Vec<PathBuf>,
     /// Cargo targets inside.
@@ -375,6 +378,7 @@ pub fn inspect<'a>(
         locked: entry.locked.clone(),
         last_activity,
         done: None,
+        pushed: None,
         output_bases: links.output_bases.iter().map(|(p, _)| p.clone()).collect(),
         targets: links.targets.iter().map(|(p, _)| p.clone()).collect(),
         checks: Checks::Pending,
@@ -384,6 +388,12 @@ pub fn inspect<'a>(
             tracing::debug!("checking if {} is merged: {e:#}", worktree.path.display());
             None
         });
+        if worktree.done.is_none() {
+            worktree.pushed = pushed(&worktree).unwrap_or_else(|e| {
+                tracing::debug!("checking if {} is pushed: {e:#}", worktree.path.display());
+                None
+            });
+        }
     }
     if force_checks || verdict(&worktree, now, config) == Verdict::Keep(Keep::Unchecked) {
         worktree.checks = match checks(&worktree, config, processes) {
@@ -426,6 +436,66 @@ fn done(worktree: &Worktree) -> Result<Option<Done>> {
         Some(1) => Ok(None),
         _ => Err(anyhow::anyhow!(ran.message())),
     }
+}
+
+/// The remote branch still holding the worktree's branch, as last fetched: its upstream unless
+/// gone, or else a branch of the same name on any remote. Asked only of branches not done.
+/// An upstream that is a shared branch does not count: `git worktree add -b x origin/main`
+/// makes `origin/main` the upstream of a branch never pushed.
+fn pushed(worktree: &Worktree) -> Result<Option<String>> {
+    let Some(branch) = &worktree.branch else {
+        return Ok(None);
+    };
+    let dir = &worktree.repo.dir;
+    let track = git::text(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)%00%(upstream:track)",
+            branch,
+        ],
+    )?;
+    if let Some((upstream, track)) = track.split_once('\0')
+        && upstream.starts_with("refs/remotes/")
+        && track != "[gone]"
+        && !is_shared(upstream, worktree.repo.default_branch.as_deref())
+    {
+        return Ok(Some(short_ref(upstream).to_owned()));
+    }
+    let Some(name) = branch.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    let found = git::text(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/*/{name}"),
+        ],
+    )?;
+    // The glob's `*` may span slashes: keep `refs/remotes/<remote>/<name>` only.
+    Ok(found
+        .lines()
+        .map(short_ref)
+        .find(|short| {
+            short
+                .strip_suffix(name)
+                .and_then(|remote| remote.strip_suffix('/'))
+                .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+        })
+        .map(str::to_owned))
+}
+
+/// Whether a remote branch is one everybody works from: the default branch, `main` or
+/// `master`.
+fn is_shared(upstream: &str, default: Option<&str>) -> bool {
+    if Some(upstream) == default {
+        return true;
+    }
+    let name = short_ref(upstream)
+        .split_once('/')
+        .map_or("", |(_, name)| name);
+    matches!(name, "main" | "master")
 }
 
 /// The first reason found to keep the worktree, cheapest checks first.
@@ -726,6 +796,98 @@ mod tests {
         let found = &survey.worktrees[0];
         assert_eq!(found.done, Some(Done::Merged("refs/heads/main".into())));
         assert_eq!(found.checks, Checks::Passed);
+    }
+
+    #[test]
+    fn knows_which_unfinished_branches_are_still_on_a_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = repo(dir.path());
+        git(&repo_dir, &["remote", "add", "origin", "/nonexistent"]);
+        git(
+            &repo_dir,
+            &["update-ref", "refs/remotes/origin/main", "main"],
+        );
+        for branch in [
+            "tracked",
+            "same-name",
+            "gone",
+            "local",
+            "nested",
+            "from-main",
+        ] {
+            let wt = worktree(&repo_dir, &dir.path().join(branch), branch);
+            git(&wt, &["commit", "--allow-empty", "-qm", branch]);
+        }
+        let head = |branch: &str| git(&repo_dir, &["rev-parse", branch]);
+        // Pushed with an upstream.
+        git(
+            &repo_dir,
+            &[
+                "update-ref",
+                "refs/remotes/origin/tracked",
+                &head("tracked"),
+            ],
+        );
+        git(
+            &repo_dir,
+            &[
+                "branch",
+                "-q",
+                "--set-upstream-to=origin/tracked",
+                "tracked",
+            ],
+        );
+        // Pushed without one.
+        git(
+            &repo_dir,
+            &[
+                "update-ref",
+                "refs/remotes/origin/same-name",
+                &head("same-name"),
+            ],
+        );
+        // Its upstream deleted, as on merging a pull request.
+        git(&repo_dir, &["config", "branch.gone.remote", "origin"]);
+        git(
+            &repo_dir,
+            &["config", "branch.gone.merge", "refs/heads/gone"],
+        );
+        // Made from origin/main, never pushed.
+        git(
+            &repo_dir,
+            &["branch", "-q", "--set-upstream-to=origin/main", "from-main"],
+        );
+        // Only a deeper remote branch ends with its name.
+        git(
+            &repo_dir,
+            &[
+                "update-ref",
+                "refs/remotes/origin/x/nested",
+                &head("nested"),
+            ],
+        );
+
+        let repos = BTreeSet::from([repo_dir.join(".git")]);
+        let config = WorktreeConfig::default();
+        let later = SystemTime::now() + 8 * DAY;
+        let survey = survey(&repos, &Inventory::default(), later, &config, dir.path());
+        let state = |branch: &str| {
+            let found = survey
+                .worktrees
+                .iter()
+                .find(|wt| wt.branch.as_deref() == Some(&format!("refs/heads/{branch}")))
+                .unwrap();
+            (found.done.clone(), found.pushed.clone())
+        };
+        assert_eq!(state("tracked"), (None, Some("origin/tracked".into())));
+        assert_eq!(state("same-name"), (None, Some("origin/same-name".into())));
+        assert_eq!(
+            state("gone"),
+            (Some(Done::UpstreamGone("origin/gone".into())), None)
+        );
+        assert_eq!(state("local"), (None, None));
+        assert_eq!(state("nested"), (None, None));
+        assert_eq!(state("from-main"), (None, None));
     }
 
     #[test]
