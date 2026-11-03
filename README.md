@@ -6,6 +6,7 @@ Cinderella for your disk. A macOS and Linux background daemon that cleans up aft
 - Bazel creates an output base for every git worktree, often tens of GB each. It stays on disk after you delete the worktree.
 - Bazel's disk cache and repository cache only shrink if you set up a garbage collector. You probably didn't.
 - Cargo never deletes old build units. Each change of features, flags, toolchain or dependency versions adds more.
+- AI coding agents make a git worktree per task and never remove it. Each holds a checkout, its build output and, with Bazel, an output base.
 - On a big repository this adds up to hundreds of GB of stuff you will never use again.
 
 ## Install
@@ -22,6 +23,7 @@ Trust issues? Look first:
 cendrillon status                 # caches and targets found, with size and last use
 cendrillon clean --dry-run        # what a full pass would delete right now
 cendrillon trim --dry-run target  # what trimming one Cargo target would delete
+cendrillon worktrees              # git worktrees found, and which would be removed
 ```
 
 - Stop and remove: `cendrillon uninstall`
@@ -37,8 +39,9 @@ cendrillon trim --dry-run target  # what trimming one Cargo target would delete
 | Install base (an extracted Bazel version) unused for 72h | Hourly sweep |
 | Cargo build units nothing current depends on | Hourly sweep |
 | Cargo target directory unused for 7 days | Hourly sweep |
+| Git worktree, clean and unused for 7 days, or 1 day once merged (opt-in) | Hourly sweep |
 
-Everything it deletes can be rebuilt or downloaded again.
+Everything it deletes can be rebuilt or downloaded again. A worktree it removes holds nothing the repository does not keep.
 
 ### When the disk fills up
 - Below 15% free space, it evicts idle output bases and disk-cache entries, oldest first, until 25% is free.
@@ -75,6 +78,34 @@ On Linux:
 - APFS clones and reflinks (XFS, btrfs; `cp` makes them by default) share blocks. Trimming a cloned target (say, copied into a new worktree) frees space only once the copy is trimmed too.
 - A unit it cannot read stops the trim of the whole target.
 
+## Git worktrees
+Off by default: set `enabled = true` under `[worktrees]`. Agents leave worktrees everywhere: `~/src/repo-topic`, `<repo>/.claude/worktrees/agent-*`, `/tmp`.
+
+It removes a linked worktree, never the main one, when all of these hold:
+- git has not locked it (`git worktree lock`). Agents lock the worktrees they work in.
+- It is clean: no change, staged or not, and no untracked file. No merge, rebase, cherry-pick, revert or bisect under way. No submodule.
+- No ignored file matches `protect`: `.env`, `.env.*`, `.envrc`, `user.bazelrc` and `*.local.*` by default. An ignored directory such as `target/` counts as one entry; it is not searched.
+- Nothing uses it: no process has its working directory, an open file or a mapped file in it. An idle Bazel server of its own output base does not count.
+- It holds no other git checkout.
+- `exclude` does not name it.
+- Nothing happened in it for `idle` (7 days), or `idle_when_merged` (1 day) once its branch is finished: its upstream branch was deleted, or HEAD is in the default branch (`origin/HEAD`, else `origin/main` or `origin/master`, else the local `main` or `master` when there is no remote).
+- What counts: its HEAD, index or HEAD log changing, a file added or removed at its top, a Bazel command in its output base, Cargo using a target in it.
+
+### How
+- A worktree's `.git` file names its repository, and a main worktree's `.git` lists its worktrees. It notes both while searching the home directory, and the repositories holding the workspaces and Cargo targets it knows.
+- Each hourly sweep, it asks git for every worktree of those repositories, wherever they are, `/tmp` included.
+- Right before removing one, it checks everything again, holding the locks of its output bases so no Bazel command starts. Anything used since planning is kept.
+- A detached HEAD that no branch, tag or remote-tracking branch holds is kept first as `refs/cendrillon/reaped/<name>-<time>`.
+- Then `git worktree remove`, without `--force`: git checks again that it is clean and unlocked. The branch stays. If some files resist git (read-only directories), cendrillon deletes the rest.
+- Its output base goes within a minute, like that of any deleted workspace.
+- It also drops git's record of a worktree whose directory was deleted, unless git locked it or it was on a volume not mounted.
+- Worktrees and repositories in the folders it never searches (see below) are left alone.
+
+### Limits
+- It needs git in `PATH`, `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`.
+- It sees only your own processes.
+- Each sweep runs `git status` in every worktree past its deadline that it still keeps, a modified one say: about half a second each in a large repository.
+
 ## Where it looks
 - Bazel's default roots: `/private/var/tmp/_bazel_$USER`, `~/Library/Caches/bazel` and `~/.cache/bazel` on macOS; `~/.cache/bazel` and `$XDG_CACHE_HOME/bazel` on Linux.
 - Paths given to `--output_user_root`, `--output_base`, `--install_base`, `--disk_cache` and `--repository_cache` in:
@@ -108,6 +139,7 @@ Anything recognized may be deleted, so it is picky:
 - **Install bases:** takes the `<install_base>.lock` running Bazel servers hold, like Bazel's own collector.
 - **Disk cache:** holds `gc/lock`, like Bazel's own collector. Skips `tmp/`, evicts `ac/` before `cas/`, and rechecks each entry's last use right before deleting it.
 - **Cargo targets:** takes `.cargo-build-lock` and `.cargo-lock` in every profile directory, or skips the target if a build holds them. Moves the garbage to a trash directory under the locks, then deletes it after releasing them. Builds wait seconds, not minutes.
+- **Git worktrees:** never the main worktree, never `--force`, never a locked, modified or busy one. Branches stay. See [Git worktrees](#git-worktrees).
 - **Late use:** anything Bazel used after cendrillon planned to delete it is kept.
 - **Symlinks:** never followed.
 - **Interrupted deletions:** finished on the next pass.
@@ -130,6 +162,13 @@ sweep_interval = "1h"         # idle deadlines
 pressure_cooldown = "10m"
 scan_home = true              # find caches and targets anywhere in your home directory
 extra_roots = []              # more directories to search for caches and targets
+
+[worktrees]
+enabled = false               # remove the git worktrees nobody uses
+idle = "7d"
+idle_when_merged = "1d"       # once the branch is merged, or its upstream deleted
+exclude = []                  # never remove these: path globs (`~/` expands) or directory names
+protect = [".env", ".env.*", ".envrc", "user.bazelrc", "*.local.*"]  # ignored files that keep a worktree
 ```
 
 After editing, run `cendrillon install` to restart the daemon.
