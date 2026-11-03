@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::env::Env;
 #[cfg(target_os = "macos")]
 use crate::fsevents;
+use crate::git;
 use crate::inventory::{Inventory, Item, MARKERS, OutputBase, TRASH_PREFIX, Workspace, classify};
 use crate::sys;
 
@@ -36,7 +37,7 @@ const PATH_FLAGS: [&str; 5] = [
 /// to it.
 const SKIPPED_NAMES: [&str; 4] = [".git", "node_modules", ".Trash", ".rustup"];
 #[cfg(target_os = "macos")]
-const SKIPPED_HOME_DIRS: [&str; 8] = [
+pub const SKIPPED_HOME_DIRS: [&str; 8] = [
     "Desktop",
     "Documents",
     "Downloads",
@@ -47,7 +48,7 @@ const SKIPPED_HOME_DIRS: [&str; 8] = [
     "Public",
 ];
 #[cfg(target_os = "linux")]
-const SKIPPED_HOME_DIRS: [&str; 1] = [".local/share/Trash"];
+pub const SKIPPED_HOME_DIRS: [&str; 1] = [".local/share/Trash"];
 
 /// After this long without a replay, the journal may have dropped part of the history since:
 /// walk the home directory again instead.
@@ -72,6 +73,10 @@ pub struct State {
     pub last_walk: Option<SystemTime>,
     /// Directories to search on every pass, besides the defaults.
     pub roots: BTreeSet<PathBuf>,
+    /// Common git directories of repositories with linked worktrees, which git lists, wherever
+    /// they are.
+    #[serde(default)]
+    pub repos: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +124,7 @@ pub fn discover(env: &Env, extra_roots: &[PathBuf], state: &State) -> Inventory 
     }
     let mut items: Vec<Item> = roots
         .iter()
-        .flat_map(|root| walk(root, ROOT_DEPTH, &env.home))
+        .flat_map(|root| walk(root, ROOT_DEPTH, &env.home, &mut BTreeSet::new()))
         .collect();
 
     let workspaces: BTreeSet<&Path> = items
@@ -142,7 +147,7 @@ pub fn discover(env: &Env, extra_roots: &[PathBuf], state: &State) -> Inventory 
     items.extend(
         workspace_roots
             .iter()
-            .flat_map(|root| walk(root, ROOT_DEPTH, &env.home)),
+            .flat_map(|root| walk(root, ROOT_DEPTH, &env.home, &mut BTreeSet::new())),
     );
     // A deletion of a whole root (a Cargo target) cut short leaves its trash beside it.
     items.extend(
@@ -166,12 +171,14 @@ pub enum HomeSearch {
 }
 
 /// Learns where caches and targets are, into `state.roots`: from what Bazel recorded, and
-/// from the home directory as `home` says. Forgets roots that are gone.
+/// from the home directory as `home` says. Forgets roots that are gone. Learns of git
+/// repositories with linked worktrees along the way, into `state.repos`.
 pub fn refresh(env: &Env, extra_roots: &[PathBuf], state: &mut State, home: HomeSearch) {
     let inventory = discover(env, extra_roots, state);
     state
         .roots
         .extend(bazel_records(env, &inventory.output_bases));
+    state.repos.extend(repos_of(env, &inventory));
     match home {
         HomeSearch::Skip => {}
         HomeSearch::Follow => follow_home(env, state),
@@ -181,6 +188,46 @@ pub fn refresh(env: &Env, extra_roots: &[PathBuf], state: &mut State, home: Home
     state
         .roots
         .retain(|root| fs::symlink_metadata(root).is_ok() || !trash_beside(root).is_empty());
+    // Git deletes `worktrees/` with the last linked worktree.
+    state.repos.retain(|repo| repo.join("worktrees").is_dir());
+}
+
+/// The repositories to survey for worktrees: those remembered, and those holding a Bazel
+/// workspace or a Cargo target cendrillon knows, the state of an older version having none.
+pub fn repos(env: &Env, state: &State, inventory: &Inventory) -> BTreeSet<PathBuf> {
+    let mut repos = repos_of(env, inventory);
+    repos.extend(state.repos.iter().cloned());
+    repos
+}
+
+/// Repositories with linked worktrees holding the Bazel workspaces and Cargo targets found.
+fn repos_of(env: &Env, inventory: &Inventory) -> BTreeSet<PathBuf> {
+    let workspaces = inventory
+        .output_bases
+        .iter()
+        .filter_map(|base| match &base.workspace {
+            Workspace::Present(path) => Some(path.as_path()),
+            _ => None,
+        });
+    let targets = inventory
+        .targets
+        .iter()
+        .filter_map(|target| target.root.parent());
+    let dirs: BTreeSet<&Path> = workspaces
+        .chain(targets)
+        .filter(|dir| !is_skipped(dir) && !in_skipped_home_dir(dir, &env.home))
+        .collect();
+    dirs.into_iter().filter_map(git::repo_containing).collect()
+}
+
+/// Whether `path` is in a folder of the home directory never searched: on macOS, one reading
+/// makes it ask the user for permission.
+pub fn in_skipped_home_dir(path: &Path, home: &Path) -> bool {
+    path.strip_prefix(home).is_ok_and(|relative| {
+        SKIPPED_HOME_DIRS
+            .iter()
+            .any(|skip| relative.starts_with(skip))
+    })
 }
 
 fn is_skipped(path: &Path) -> bool {
@@ -233,13 +280,16 @@ fn walk_home(env: &Env, state: &mut State) {
     let started = Instant::now();
     #[cfg(target_os = "macos")]
     let (volume, event) = (fsevents::volume(&env.home), fsevents::current_event());
-    let found = walk_roots(std::slice::from_ref(&env.home), &env.home);
+    let (found, repos) = walk_roots(std::slice::from_ref(&env.home), &env.home);
     tracing::info!(
-        "walked the home directory in {:.0?}: {} cache locations",
+        "walked the home directory in {:.0?}: {} cache locations, {} repositories with \
+         worktrees",
         started.elapsed(),
-        found.len()
+        found.len(),
+        repos.len()
     );
     state.roots.extend(found);
+    state.repos.extend(repos);
     state.last_walk = Some(SystemTime::now());
     #[cfg(target_os = "macos")]
     {
@@ -298,7 +348,8 @@ fn follow_home(env: &Env, state: &mut State) {
         .dirs
         .iter()
         .filter(|dir| !sealed.iter().any(|root| dir.starts_with(root)));
-    let mut found = roots_containing(changed, &env.home);
+    let (mut found, repos) = roots_containing(changed, &env.home);
+    state.repos.extend(repos);
     // The journal lost what happened under these: search them all.
     let lost: BTreeSet<PathBuf> = changes
         .rescan
@@ -309,7 +360,9 @@ fn follow_home(env: &Env, state: &mut State) {
             false => env.home.clone(),
         })
         .collect();
-    found.extend(walk_roots(&Vec::from_iter(lost), &env.home));
+    let (walked, repos) = walk_roots(&Vec::from_iter(lost), &env.home);
+    found.extend(walked);
+    state.repos.extend(repos);
     for root in found.difference(&state.roots) {
         tracing::info!("found {} in the home directory's changes", root.display());
     }
@@ -355,14 +408,16 @@ fn sealed_roots(env: &Env, state: &State) -> Vec<PathBuf> {
     sealed
 }
 
-/// Search roots of the caches and targets holding `dirs`, directories changed under `home`.
+/// Search roots of the caches and targets holding `dirs`, directories changed under `home`,
+/// and the repositories with worktrees holding them (a new worktree is written to).
 #[cfg(target_os = "macos")]
 fn roots_containing<'a>(
     dirs: impl IntoIterator<Item = &'a PathBuf>,
     home: &Path,
-) -> BTreeSet<PathBuf> {
+) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
     let mut checked = HashSet::new();
     let mut roots = BTreeSet::new();
+    let mut repos = BTreeSet::new();
     for dir in dirs.into_iter().filter(|dir| !is_skipped(dir)) {
         let ancestors = dir
             .ancestors()
@@ -372,21 +427,26 @@ fn roots_containing<'a>(
             if !checked.insert(ancestor.to_path_buf()) {
                 break;
             }
+            repos.extend(git::repo_of(&ancestor.join(".git")));
             if let Some(item) = classify(ancestor) {
                 roots.extend(search_root(&item));
                 break;
             }
         }
     }
-    roots
+    (roots, repos)
 }
 
-/// Search roots of the caches and targets found walking `dirs` all the way down.
-fn walk_roots(dirs: &[PathBuf], home: &Path) -> BTreeSet<PathBuf> {
-    dirs.iter()
-        .flat_map(|dir| walk(dir, usize::MAX, home))
+/// Search roots of the caches and targets found walking `dirs` all the way down, and the
+/// repositories with worktrees found on the way.
+fn walk_roots(dirs: &[PathBuf], home: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
+    let mut repos = BTreeSet::new();
+    let roots = dirs
+        .iter()
+        .flat_map(|dir| walk(dir, usize::MAX, home, &mut repos))
         .filter_map(|item| search_root(&item))
-        .collect()
+        .collect();
+    (roots, repos)
 }
 
 /// The directory to search to find `item` again, along with its siblings: the output user
@@ -401,8 +461,9 @@ fn search_root(item: &Item) -> Option<PathBuf> {
 }
 
 /// Classifies directories under `root`, not descending into what it recognizes, nor into
-/// other volumes.
-fn walk(root: &Path, max_depth: usize, home: &Path) -> Vec<Item> {
+/// other volumes. A repository with linked worktrees met on the way goes into `repos`, from
+/// the `.git` entry of either kind of worktree: `.git` itself is never entered.
+fn walk(root: &Path, max_depth: usize, home: &Path, repos: &mut BTreeSet<PathBuf>) -> Vec<Item> {
     let Ok(root) = fs::canonicalize(root) else {
         return Vec::new();
     };
@@ -418,6 +479,13 @@ fn walk(root: &Path, max_depth: usize, home: &Path) -> Vec<Item> {
         let entries: Option<Vec<fs::DirEntry>> = fs::read_dir(&dir)
             .ok()
             .map(|entries| entries.filter_map(Result::ok).collect());
+        if let Some(dot_git) = entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.file_name() == ".git")
+        {
+            repos.extend(git::repo_of(&dot_git.path()));
+        }
         let may_be_item = entries.as_ref().is_none_or(|entries| {
             entries
                 .iter()
@@ -668,7 +736,7 @@ mod tests {
         disk_cache(&env.home.join("Library/Developer/disk"), &[]);
         let bazel = disk_cache(&env.home.join("Library/Caches/bazel/disk"), &[]);
 
-        let roots = walk_roots(std::slice::from_ref(&env.home), &env.home);
+        let (roots, _) = walk_roots(std::slice::from_ref(&env.home), &env.home);
         assert_eq!(roots, BTreeSet::from([env.home.join("odd/place/root")]));
         assert!(
             !watched_dirs(&env.home)
@@ -677,9 +745,8 @@ mod tests {
         );
 
         let state = State {
-            journal: None,
-            last_walk: None,
             roots,
+            ..State::default()
         };
         let inventory = discover(&env, &[], &state);
         assert_eq!(inventory.output_bases.len(), 1);
@@ -732,7 +799,7 @@ mod tests {
         disk_cache(&env.home.join("src/node_modules/cache"), &[]);
         let documents = disk_cache(&env.home.join("Documents/cache"), &[]);
 
-        let roots = walk_roots(std::slice::from_ref(&env.home), &env.home);
+        let (roots, _) = walk_roots(std::slice::from_ref(&env.home), &env.home);
         assert_eq!(
             roots,
             BTreeSet::from([env.home.join("odd/place/root"), documents])
@@ -780,7 +847,7 @@ mod tests {
         let trash = env.home.join(format!("f/{TRASH_PREFIX}x-1"));
         fs::create_dir_all(&trash).unwrap();
 
-        let found: BTreeSet<PathBuf> = walk(&env.home, usize::MAX, &env.home)
+        let found: BTreeSet<PathBuf> = walk(&env.home, usize::MAX, &env.home, &mut BTreeSet::new())
             .iter()
             .map(|item| item.path().to_path_buf())
             .collect();
@@ -810,7 +877,7 @@ mod tests {
         fs::set_permissions(&documents, mode(0o000)).unwrap();
         disk_cache(&env.home.join("src/a/b/c/disk"), &[]);
 
-        let roots = walk_roots(std::slice::from_ref(&env.home), &env.home);
+        let (roots, _) = walk_roots(std::slice::from_ref(&env.home), &env.home);
         fs::set_permissions(&documents, mode(0o755)).unwrap();
         assert_eq!(roots, BTreeSet::from([env.home.join("src/a/b/c/disk")]));
     }
@@ -831,7 +898,7 @@ mod tests {
             env.home.join("src/deleted"),
         ];
         assert_eq!(
-            roots_containing(&changed, &env.home),
+            roots_containing(&changed, &env.home).0,
             BTreeSet::from([cache])
         );
     }
@@ -868,6 +935,7 @@ mod tests {
             journal: None,
             last_walk: None,
             roots: BTreeSet::from([cache.clone(), target.clone(), gone.clone()]),
+            repos: BTreeSet::new(),
         };
         refresh(&env, &[], &mut state, HomeSearch::Skip);
         assert!(state.roots.contains(&cache));
@@ -908,6 +976,7 @@ mod tests {
             journal: None,
             last_walk: None,
             roots: BTreeSet::from([env.home.join("src/repo/target")]),
+            repos: BTreeSet::new(),
         };
         assert_eq!(discover(&env, &[], &state).trash, [trash]);
     }
@@ -925,6 +994,7 @@ mod tests {
             }),
             last_walk: Some(SystemTime::UNIX_EPOCH),
             roots: BTreeSet::from([PathBuf::from("/a")]),
+            repos: BTreeSet::from([PathBuf::from("/r/.git")]),
         };
         state.save(&path).unwrap();
         assert_eq!(State::load(&path), state);
@@ -938,7 +1008,61 @@ mod tests {
                 journal: None,
                 last_walk: None,
                 roots: BTreeSet::from([PathBuf::from("/a")]),
+                repos: BTreeSet::new(),
             }
         );
+        // Written before worktrees were looked after.
+        fs::write(
+            &path,
+            r#"{"journal": null, "last_walk": null, "roots": ["/a"]}"#,
+        )
+        .unwrap();
+        assert!(State::load(&path).repos.is_empty());
+        assert_eq!(
+            State::load(&path).roots,
+            BTreeSet::from([PathBuf::from("/a")])
+        );
+    }
+
+    #[test]
+    fn learns_of_repositories_with_worktrees_from_the_walk_and_what_is_built() {
+        use crate::git::fixtures::{repo, worktree};
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        // Found by a walk from its main worktree.
+        let walked = repo(&env.home.join("src/a"));
+        worktree(&walked, &env.home.join("src/a-wt"), "x");
+        // Found from the linked worktree alone, its repository outside the home directory.
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = repo(outside.path());
+        worktree(&elsewhere, &env.home.join("src/b-wt"), "y");
+        // No linked worktree: nothing to look after.
+        repo(&env.home.join("src/c"));
+
+        let (_, walked_repos) = walk_roots(std::slice::from_ref(&env.home), &env.home);
+        assert_eq!(
+            walked_repos,
+            BTreeSet::from([walked.join(".git"), elsewhere.join(".git")])
+        );
+
+        // An output base of a workspace in a worktree leads to its repository.
+        let third = tempfile::tempdir().unwrap();
+        let built = repo(third.path());
+        let workspace = worktree(&built, &third.path().join("wt"), "z");
+        let user_root = third.path().join("bazel");
+        crate::inventory::fixtures::output_base(&user_root, "base", &workspace, SystemTime::now());
+        let state = State {
+            roots: BTreeSet::from([user_root]),
+            repos: BTreeSet::from([walked.join(".git"), dir.path().join("gone/.git")]),
+            ..State::default()
+        };
+        let mut refreshed = state.clone();
+        refresh(&env, &[], &mut refreshed, HomeSearch::Skip);
+        assert_eq!(
+            refreshed.repos,
+            BTreeSet::from([walked.join(".git"), built.join(".git")])
+        );
+        let inventory = discover(&env, &[], &state);
+        assert!(repos(&env, &state, &inventory).contains(&built.join(".git")));
     }
 }
