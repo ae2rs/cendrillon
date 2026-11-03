@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::cargo::{self, Target};
 use crate::sys;
+use crate::worktree::{Prunable, Worktree};
 
 /// Name prefix of a directory renamed for deletion, finished on a later pass if interrupted.
 pub const TRASH_PREFIX: &str = ".cendrillon-trash-";
@@ -165,7 +166,7 @@ fn only_children(dir: &Path, allowed: impl Fn(&str, FileType) -> bool) -> bool {
 }
 
 impl Workspace {
-    fn check(path: PathBuf) -> Self {
+    pub fn check(path: PathBuf) -> Self {
         match fs::symlink_metadata(&path) {
             Ok(_) => Workspace::Present(path),
             Err(e)
@@ -178,6 +179,13 @@ impl Workspace {
             Err(_) => Workspace::Unreachable(path),
         }
     }
+}
+
+/// Whether `path` is gone for good: not found, and not where an unmounted volume would be. Its
+/// parent may be gone too, unlike for a [`Workspace::Missing`].
+pub fn is_deleted(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        && volume_mounted(path)
 }
 
 /// False when `path` lies on a volume under `/Volumes` that is not mounted right now.
@@ -294,6 +302,10 @@ pub struct Inventory {
     pub caches: Vec<Cache>,
     pub targets: Vec<Target>,
     pub trash: Vec<PathBuf>,
+    /// Linked git worktrees, surveyed on full sweeps when their reaper is enabled.
+    pub worktrees: Vec<Worktree>,
+    /// Records of worktrees whose directory is gone.
+    pub prunable: Vec<Prunable>,
 }
 
 impl FromIterator<Item> for Inventory {

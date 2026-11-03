@@ -16,6 +16,7 @@ mod planner;
 mod sys;
 #[cfg(target_os = "linux")]
 mod systemd;
+mod worktree;
 
 #[cfg(target_os = "macos")]
 use launchd as service;
@@ -88,7 +89,8 @@ fn main() -> Result<()> {
         .init();
 
     let env = Env::current()?;
-    let config = Config::load(&cli.config.unwrap_or_else(|| env.config_file()))?;
+    let mut config = Config::load(&cli.config.unwrap_or_else(|| env.config_file()))?;
+    config.worktrees.expand_home(&env.home);
     match cli.command {
         Command::Status => status(&env, &config),
         Command::Clean { dry_run } => {
@@ -132,6 +134,7 @@ fn executor<'a>(config: &Config, dry_run: bool, stop: &'a AtomicBool) -> Executo
         stop,
         unit_idle: config.unit_idle,
         observed: &no_observed_reads,
+        worktrees: config.worktrees.clone(),
     }
 }
 

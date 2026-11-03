@@ -1,5 +1,6 @@
 //! Carrying out a plan without racing Bazel or Cargo.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -10,12 +11,15 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 
 use crate::cargo::{self, Target};
+use crate::config::WorktreeConfig;
+use crate::git;
 use crate::inventory::{
     self, Cache, CacheKind, InstallBase, OutputBase, TRASH_PREFIX, disk_cache_entries,
     repository_cache_entries,
 };
-use crate::planner::Action;
+use crate::planner::{Action, Verdict, verdict};
 use crate::sys::{self, FileLock};
+use crate::worktree::{self, Prunable, Worktree};
 
 /// How long a Bazel server gets to exit after SIGTERM, and again after SIGKILL.
 const SERVER_GRACE: Duration = Duration::from_secs(10);
@@ -28,11 +32,18 @@ pub struct Executor<'a> {
     pub unit_idle: Duration,
     /// The reads of a target's hash files seen as they happened, on Linux.
     pub observed: &'a dyn Fn(&Path) -> cargo::Observed,
+    /// When worktrees go, to check again right before removing one.
+    pub worktrees: WorktreeConfig,
 }
 
+#[derive(Debug)]
 enum Outcome {
     Freed(u64),
-    Skipped(&'static str),
+    Skipped(Cow<'static, str>),
+}
+
+fn skipped(why: impl Into<Cow<'static, str>>) -> Result<Outcome> {
+    Ok(Outcome::Skipped(why.into()))
 }
 
 impl Executor<'_> {
@@ -47,6 +58,14 @@ impl Executor<'_> {
             match self.apply(action) {
                 Ok(Outcome::Freed(0))
                     if matches!(action, Action::EvictEntries { .. } | Action::TrimTarget(_)) => {}
+                Ok(Outcome::Freed(_)) if matches!(action, Action::PruneWorktree(_)) => {
+                    let verb = if self.dry_run {
+                        "would drop"
+                    } else {
+                        "dropped"
+                    };
+                    tracing::info!("{verb} {what}: {reason}");
+                }
                 Ok(Outcome::Freed(bytes)) => {
                     freed += bytes;
                     let verb = if self.dry_run { "would free" } else { "freed" };
@@ -76,6 +95,8 @@ impl Executor<'_> {
             },
             Action::TrimTarget(target) => self.trim_target(target),
             Action::DeleteTarget { target, .. } => self.delete_target(target),
+            Action::ReapWorktree { worktree, .. } => self.reap_worktree(worktree),
+            Action::PruneWorktree(prunable) => self.prune_worktree(prunable),
         }
     }
 
@@ -83,14 +104,12 @@ impl Executor<'_> {
     /// the base aside and deletes it.
     fn delete_output_base(&self, base: &OutputBase) -> Result<Outcome> {
         let Some(lock) = sys::try_lock(&base.path.join("lock"))? else {
-            return Ok(Outcome::Skipped("a Bazel command is running"));
+            return skipped("a Bazel command is running");
         };
         // Opening the lock leaves its mtime alone. A lock file that was missing is created
         // now, so the base is kept this pass and deleted on the next.
         if inventory::last_used(&base.path)? != base.last_used {
-            return Ok(Outcome::Skipped(
-                "Bazel used it while cendrillon was planning",
-            ));
+            return skipped("Bazel used it while cendrillon was planning");
         }
         if self.dry_run {
             return Ok(Outcome::Freed(sys::tree_size(&base.path)));
@@ -114,12 +133,10 @@ impl Executor<'_> {
         lock_name.push(".lock");
         let lock_path = base.path.with_file_name(lock_name);
         let Some(lock) = sys::try_lock(&lock_path)? else {
-            return Ok(Outcome::Skipped("a Bazel server is using it"));
+            return skipped("a Bazel server is using it");
         };
         if fs::symlink_metadata(&base.path)?.modified()? != base.last_used {
-            return Ok(Outcome::Skipped(
-                "Bazel used it while cendrillon was planning",
-            ));
+            return skipped("Bazel used it while cendrillon was planning");
         }
         if self.dry_run {
             return Ok(Outcome::Freed(sys::tree_size(&base.path)));
@@ -137,7 +154,7 @@ impl Executor<'_> {
         let gc_dir = cache.root.join("gc");
         fs::create_dir_all(&gc_dir)?;
         let Some(_lock) = sys::try_lock(&gc_dir.join("lock"))? else {
-            return Ok(Outcome::Skipped("Bazel is collecting garbage in it"));
+            return skipped("Bazel is collecting garbage in it");
         };
         let mut seen = HashSet::new();
         let mut freed = 0;
@@ -197,7 +214,7 @@ impl Executor<'_> {
             return Ok(Outcome::Freed(freed + bytes));
         }
         let Some(locks) = lock_profiles(&target.root)? else {
-            return Ok(Outcome::Skipped("a Cargo build is running"));
+            return skipped("a Cargo build is running");
         };
         cargo::record_reads(&target.root, &(self.observed)(&target.root))
             .with_context(|| format!("recording reads in {}", target.root.display()))?;
@@ -237,7 +254,7 @@ impl Executor<'_> {
             return Ok(Outcome::Freed(sys::tree_size(&target.root)));
         }
         let Some(locks) = lock_profiles(&target.root)? else {
-            return Ok(Outcome::Skipped("a Cargo build is running"));
+            return skipped("a Cargo build is running");
         };
         // Checked under the locks, so no build slips in after it. Creating a missing lock file
         // changes the profile's mtime: the target is then kept until the next pass.
@@ -246,13 +263,145 @@ impl Executor<'_> {
         // The read log keeps whole seconds, so only a later second means Cargo came back.
         let planned = target.last_used + Duration::from_secs(1);
         if Target::classify(&target.root).is_none_or(|found| found.last_used > planned) {
-            return Ok(Outcome::Skipped(
-                "Cargo used it while cendrillon was planning",
-            ));
+            return skipped("Cargo used it while cendrillon was planning");
         }
         let trash = move_to_trash(&target.root)?;
         drop(locks);
         self.remove(&trash).map(Outcome::Freed)
+    }
+
+    /// Removes a linked worktree with git, keeping its branch, once everything that planned it
+    /// still holds. Holds the locks of its output bases meanwhile, so no Bazel command starts
+    /// in it. Its output bases go on the next pass, as those of a deleted workspace.
+    fn reap_worktree(&self, planned: &Worktree) -> Result<Outcome> {
+        // The walk takes a while: not under the locks.
+        let (size, nested) = worktree::measure(&planned.path);
+        if let Some(nested) = nested {
+            return skipped(worktree::Blocker::Nested(nested).to_string());
+        }
+        let mut locks = Vec::new();
+        for base in &planned.output_bases {
+            match sys::try_lock(&base.join("lock")) {
+                Ok(Some(lock)) => locks.push(lock),
+                Ok(None) => return skipped("a Bazel command is running in it"),
+                // Deleted meanwhile.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("locking {}", base.display())),
+            }
+        }
+        let now = SystemTime::now();
+        let Some(worktree) = worktree::reinspect(planned, now, &self.worktrees)? else {
+            return skipped("git no longer lists it as a linked worktree");
+        };
+        if let Verdict::Keep(why) = verdict(&worktree, now, &self.worktrees) {
+            return skipped(why.to_string());
+        }
+        if worktree.last_activity > planned.last_activity {
+            return skipped("used while cendrillon was planning");
+        }
+        if (&worktree.head, &worktree.branch) != (&planned.head, &planned.branch) {
+            return skipped("its HEAD moved while cendrillon was planning");
+        }
+        self.keep_head(
+            &worktree.repo,
+            &worktree.path,
+            &worktree.name(),
+            worktree.head.as_deref(),
+            worktree.branch.as_deref(),
+        )?;
+        if self.dry_run {
+            return Ok(Outcome::Freed(size));
+        }
+        let mut command = git::command(&worktree.repo.dir)?;
+        command.args(["worktree", "remove"]).arg(&worktree.path);
+        git::shield(&mut command);
+        let removed = git::run(command, git::TIMEOUT * 5)?;
+        drop(locks);
+        if removed.status.success() {
+            return Ok(Outcome::Freed(size));
+        }
+        // Git checks the worktree, then deletes its files, then its record, even when some
+        // files resisted. A record gone means git checked it and meant to delete it all.
+        let record_gone = worktree
+            .admin
+            .as_deref()
+            .is_some_and(|admin| fs::symlink_metadata(admin).is_err());
+        if !record_gone || fs::symlink_metadata(&worktree.path).is_err() {
+            return skipped(format!("git refused to remove it: {}", removed.message()));
+        }
+        tracing::info!(
+            "git removed worktree {} but left files ({}); deleting the rest",
+            worktree.path.display(),
+            removed.message()
+        );
+        let trash = move_to_trash(&worktree.path)?;
+        self.remove(&trash)?;
+        Ok(Outcome::Freed(size))
+    }
+
+    /// Drops git's record of a worktree whose directory is gone, unless the directory may only
+    /// be out of reach, on a volume that is not mounted.
+    fn prune_worktree(&self, prunable: &Prunable) -> Result<Outcome> {
+        if !inventory::is_deleted(&prunable.path) {
+            return skipped("its directory is back, or on a volume not mounted");
+        }
+        let (_, entries) = worktree::Repo::list(&prunable.repo.git_dir)?;
+        let Some(entry) = entries.iter().skip(1).find(|e| e.path == prunable.path) else {
+            return skipped("git has no record of it any more");
+        };
+        if entry.locked.is_some() {
+            return skipped("locked");
+        }
+        if !entry.prunable {
+            return skipped("its directory is back");
+        }
+        let name = prunable.path.file_name().unwrap_or_default();
+        self.keep_head(
+            &prunable.repo,
+            &prunable.path,
+            &name.to_string_lossy(),
+            entry.head.as_deref(),
+            entry.branch.as_deref(),
+        )?;
+        if self.dry_run {
+            return Ok(Outcome::Freed(0));
+        }
+        // With the directory gone, `remove` drops just this record, where `prune` would drop
+        // every one whose directory is missing.
+        let mut command = git::command(&prunable.repo.dir)?;
+        command.args(["worktree", "remove"]).arg(&prunable.path);
+        git::run(command, git::TIMEOUT)?.checked()?;
+        Ok(Outcome::Freed(0))
+    }
+
+    /// Keeps a detached HEAD no ref holds as `refs/cendrillon/reaped/<name>-<time>`, before
+    /// the worktree at `path` goes with its reflog.
+    fn keep_head(
+        &self,
+        repo: &worktree::Repo,
+        path: &Path,
+        name: &str,
+        head: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<()> {
+        let Some(head) = worktree::unreachable_head(repo, head, branch)? else {
+            return Ok(());
+        };
+        let name = worktree::keep_ref(name, SystemTime::now());
+        let verb = if self.dry_run {
+            "would keep"
+        } else {
+            "keeping"
+        };
+        tracing::info!(
+            "{verb} detached HEAD {head} of worktree {} as {name}",
+            path.display()
+        );
+        if !self.dry_run {
+            git::output(&repo.dir, &["update-ref", &name, head])
+                .with_context(|| format!("creating {name}"))?;
+        }
+        Ok(())
     }
 
     fn remove(&self, path: &Path) -> Result<u64> {
@@ -353,6 +502,14 @@ fn describe(action: &Action) -> (String, String) {
             format!("Cargo target {}", target.root.display()),
             reason.to_string(),
         ),
+        Action::ReapWorktree { worktree, reason } => (
+            format!("git worktree {}", worktree.path.display()),
+            reason.to_string(),
+        ),
+        Action::PruneWorktree(prunable) => (
+            format!("git's record of worktree {}", prunable.path.display()),
+            "its directory is gone".into(),
+        ),
     }
 }
 
@@ -389,6 +546,7 @@ mod tests {
             stop: &RUNNING,
             unit_idle: Duration::ZERO,
             observed: &|_| cargo::Observed::new(),
+            worktrees: WorktreeConfig::default(),
         }
     }
 
@@ -624,6 +782,353 @@ mod tests {
         assert!(executor(false).run(&[delete_target(target)]) > 0);
         assert!(!ws.target().exists());
         assert!(trash_in(&ws.root).is_empty());
+    }
+
+    mod worktrees {
+        use super::*;
+        use crate::config::Config;
+        use crate::git::fixtures::{backdate, git, repo, worktree};
+        use crate::inventory::Inventory;
+        use crate::planner::{Keep, Sweep, plan};
+        use crate::worktree::{Blocker, Checks, survey};
+        use std::collections::BTreeSet;
+
+        const DAY: Duration = Duration::from_secs(24 * 3600);
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            root: PathBuf,
+            repo: PathBuf,
+            /// What worktrees are dated from.
+            now: SystemTime,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let root = fs::canonicalize(dir.path()).unwrap();
+                let repo = repo(&root);
+                Self {
+                    _dir: dir,
+                    root,
+                    repo,
+                    now: SystemTime::now(),
+                }
+            }
+
+            /// A worktree on a new branch at main's commit, untouched for `age`.
+            fn worktree(&self, name: &str, age: Duration) -> PathBuf {
+                let path = worktree(&self.repo, &self.root.join(name), name);
+                backdate(&path, self.now - age);
+                path
+            }
+
+            fn survey(&self) -> Vec<Worktree> {
+                let repos = BTreeSet::from([self.repo.join(".git")]);
+                let config = WorktreeConfig::default();
+                let now = SystemTime::now();
+                survey(&repos, &Inventory::default(), now, &config, &self.root).worktrees
+            }
+
+            fn found(&self, path: &Path) -> Worktree {
+                self.survey()
+                    .into_iter()
+                    .find(|worktree| worktree.path == path)
+                    .unwrap()
+            }
+
+            fn listed(&self) -> String {
+                git(&self.repo, &["worktree", "list", "--porcelain"])
+            }
+        }
+
+        /// What a sweep now plans for the worktree at `path`.
+        fn planned(fixture: &Fixture, path: &Path) -> Option<Action> {
+            let inventory = Inventory {
+                worktrees: fixture.survey(),
+                ..Inventory::default()
+            };
+            let config = Config {
+                worktrees: WorktreeConfig {
+                    enabled: true,
+                    ..WorktreeConfig::default()
+                },
+                ..Config::default()
+            };
+            plan(
+                &inventory,
+                SystemTime::now(),
+                &config,
+                Sweep::Full { pressure: None },
+            )
+            .into_iter()
+            .find(|action| matches!(action, Action::ReapWorktree { worktree, .. } if worktree.path == path))
+        }
+
+        /// A reap planned as if every check had passed, for the executor's last look to catch
+        /// what changed since.
+        fn forced(worktree: Worktree) -> Action {
+            Action::ReapWorktree {
+                worktree: Box::new(Worktree {
+                    checks: Checks::Passed,
+                    locked: None,
+                    ..worktree
+                }),
+                reason: Reason::Idle(8 * DAY),
+            }
+        }
+
+        fn kept_because(action: &Action) -> String {
+            match executor(false).apply(action).unwrap() {
+                Outcome::Skipped(why) => why.into_owned(),
+                Outcome::Freed(bytes) => panic!("removed, freeing {bytes} bytes"),
+            }
+        }
+
+        #[test]
+        fn reaps_a_clean_merged_idle_worktree_and_keeps_its_branch() {
+            let fixture = Fixture::new();
+            let path = fixture.worktree("done", 2 * DAY);
+            fs::create_dir_all(path.join("target/debug")).unwrap();
+            fs::write(path.join("target/debug/app"), vec![0u8; 100_000]).unwrap();
+            backdate(&path, fixture.now - 2 * DAY);
+            let action = planned(&fixture, &path).expect("no reap planned");
+            let Action::ReapWorktree { reason, .. } = &action else {
+                unreachable!()
+            };
+            assert!(
+                reason
+                    .to_string()
+                    .starts_with("merged into main, unused for 2days")
+            );
+
+            assert!(executor(true).run(std::slice::from_ref(&action)) >= 100_000);
+            assert!(path.join("README").exists());
+
+            assert!(executor(false).run(&[action]) >= 100_000);
+            assert!(!path.exists());
+            assert!(fixture.root.join("repo").exists());
+            assert!(!fixture.listed().contains("done\n"));
+            assert_eq!(git(&fixture.repo, &["branch", "--list", "done"]), "done");
+        }
+
+        #[test]
+        fn an_unmerged_worktree_waits_for_the_longer_deadline() {
+            let fixture = Fixture::new();
+            let path = fixture.worktree("work", 2 * DAY);
+            git(&path, &["commit", "-q", "--allow-empty", "-m", "wip"]);
+            backdate(&path, fixture.now - 2 * DAY);
+            assert_eq!(planned(&fixture, &path), None);
+            backdate(&path, fixture.now - 8 * DAY);
+            assert!(planned(&fixture, &path).is_some());
+        }
+
+        #[test]
+        fn keeps_worktrees_with_anything_to_lose() {
+            let fixture = Fixture::new();
+            type Case<'a> = (&'a str, &'a dyn Fn(&Path), &'a str);
+            let cases: [Case; 6] = [
+                (
+                    "modified",
+                    &|wt| fs::write(wt.join("README"), "changed").unwrap(),
+                    "uncommitted",
+                ),
+                (
+                    "staged",
+                    &|wt| {
+                        fs::write(wt.join("README"), "staged").unwrap();
+                        git(wt, &["add", "README"]);
+                    },
+                    "uncommitted",
+                ),
+                (
+                    "untracked",
+                    &|wt| fs::write(wt.join("notes.txt"), "x").unwrap(),
+                    "untracked",
+                ),
+                (
+                    "protected",
+                    &|wt| fs::write(wt.join(".env"), "TOKEN=x").unwrap(),
+                    "protected ignored file .env",
+                ),
+                (
+                    "merging",
+                    &|wt| {
+                        let admin = git::admin_dir(wt).unwrap();
+                        fs::write(admin.join("MERGE_HEAD"), "0000").unwrap();
+                    },
+                    "a merge is in progress",
+                ),
+                (
+                    "nested",
+                    &|wt| {
+                        fs::create_dir_all(wt.join("target/inner")).unwrap();
+                        git(&wt.join("target/inner"), &["init", "-q"]);
+                    },
+                    "holds another git checkout",
+                ),
+            ];
+            for (name, spoil, why) in cases {
+                let path = fixture.worktree(name, 8 * DAY);
+                let clean = fixture.found(&path);
+                spoil(&path);
+                backdate(&path, fixture.now - 8 * DAY);
+                if name != "nested" {
+                    // Not even planned...
+                    assert_eq!(planned(&fixture, &path), None, "{name}");
+                }
+                // ...and caught by the last look if it changed after planning.
+                let kept = kept_because(&forced(clean));
+                assert!(kept.contains(why), "{name}: {kept}");
+                assert!(path.join("README").exists(), "{name}");
+            }
+        }
+
+        #[test]
+        fn keeps_locked_recent_and_main_worktrees() {
+            let fixture = Fixture::new();
+            let locked = fixture.worktree("locked", 8 * DAY);
+            git(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "lock",
+                    "--reason",
+                    "agent at work",
+                    locked.to_str().unwrap(),
+                ],
+            );
+            let found = fixture.found(&locked);
+            assert_eq!(
+                verdict(&found, SystemTime::now(), &WorktreeConfig::default()),
+                Verdict::Keep(Keep::Locked("agent at work".into()))
+            );
+            assert_eq!(kept_because(&forced(found)), "locked: agent at work");
+
+            let recent = fixture.worktree("recent", Duration::ZERO);
+            assert_eq!(planned(&fixture, &recent), None);
+            assert!(kept_because(&forced(fixture.found(&recent))).starts_with("active"));
+
+            let main = Worktree {
+                path: fixture.repo.clone(),
+                ..fixture.found(&recent)
+            };
+            assert!(kept_because(&forced(main)).contains("no longer lists it"));
+            assert!(fixture.survey().iter().all(|wt| wt.path != fixture.repo));
+            assert!(locked.exists() && recent.exists() && fixture.repo.join("README").exists());
+        }
+
+        #[test]
+        fn keeps_a_worktree_a_process_works_in() {
+            let fixture = Fixture::new();
+            let path = fixture.worktree("busy", 8 * DAY);
+            fs::create_dir(path.join("src")).unwrap();
+            backdate(&path, fixture.now - 8 * DAY);
+            let clean = fixture.found(&path);
+            let mut shell = std::process::Command::new("sleep")
+                .arg("60")
+                .current_dir(path.join("src"))
+                .spawn()
+                .unwrap();
+            let planned_while_busy = planned(&fixture, &path);
+            let kept = kept_because(&forced(clean));
+            shell.kill().unwrap();
+            shell.wait().unwrap();
+            assert_eq!(planned_while_busy, None);
+            assert_eq!(kept, format!("in use by pid {}", shell.id()));
+            assert!(path.exists());
+        }
+
+        #[test]
+        fn keeps_a_detached_head_in_a_ref_before_reaping() {
+            let fixture = Fixture::new();
+            let path = fixture.root.join("detached");
+            git(
+                &fixture.repo,
+                &["worktree", "add", "-q", "--detach", path.to_str().unwrap()],
+            );
+            git(&path, &["commit", "-q", "--allow-empty", "-m", "only here"]);
+            let head = git(&path, &["rev-parse", "HEAD"]);
+            backdate(&path, fixture.now - 8 * DAY);
+            let action = planned(&fixture, &path).expect("no reap planned");
+
+            executor(true).run(std::slice::from_ref(&action));
+            let kept = || {
+                git(
+                    &fixture.repo,
+                    &["for-each-ref", "--format=%(objectname)", "refs/cendrillon/"],
+                )
+            };
+            assert_eq!(kept(), "");
+
+            assert!(executor(false).run(&[action]) > 0);
+            assert!(!path.exists());
+            assert_eq!(kept(), head);
+        }
+
+        #[test]
+        fn finishes_what_git_could_not_delete() {
+            let fixture = Fixture::new();
+            let path = fixture.worktree("stuck", 8 * DAY);
+            let read_only = path.join("target/ro");
+            fs::create_dir_all(&read_only).unwrap();
+            fs::write(read_only.join("file"), "x").unwrap();
+            fs::set_permissions(
+                &read_only,
+                std::os::unix::fs::PermissionsExt::from_mode(0o555),
+            )
+            .unwrap();
+            backdate(&path, fixture.now - 8 * DAY);
+            let action = planned(&fixture, &path).expect("no reap planned");
+
+            assert!(executor(false).run(&[action]) > 0);
+            assert!(!path.exists());
+            assert!(trash_in(&fixture.root).is_empty());
+        }
+
+        #[test]
+        fn drops_records_of_deleted_worktrees_keeping_their_detached_head() {
+            let fixture = Fixture::new();
+            // Deleted with its parent, as a scratch directory under /tmp is.
+            let scratch = fixture.root.join("scratch");
+            fs::create_dir(&scratch).unwrap();
+            let path = scratch.join("deleted");
+            git(
+                &fixture.repo,
+                &["worktree", "add", "-q", "--detach", path.to_str().unwrap()],
+            );
+            git(&path, &["commit", "-q", "--allow-empty", "-m", "only here"]);
+            let head = git(&path, &["rev-parse", "HEAD"]);
+            fs::remove_dir_all(&scratch).unwrap();
+            let kept = fixture.worktree("kept", Duration::ZERO);
+            let repos = BTreeSet::from([fixture.repo.join(".git")]);
+            let config = WorktreeConfig::default();
+            let now = SystemTime::now();
+            let found = survey(&repos, &Inventory::default(), now, &config, &fixture.root);
+            assert_eq!(found.prunable.len(), 1);
+            let action = Action::PruneWorktree(found.prunable[0].clone());
+
+            executor(true).run(std::slice::from_ref(&action));
+            assert!(fixture.listed().contains("prunable"));
+
+            executor(false).run(&[action]);
+            let listed = fixture.listed();
+            assert!(
+                !listed.contains("prunable") && !listed.contains("deleted"),
+                "{listed}"
+            );
+            assert!(listed.contains(kept.to_str().unwrap()));
+            let refs = ["for-each-ref", "--format=%(objectname)", "refs/cendrillon/"];
+            assert_eq!(git(&fixture.repo, &refs), head);
+        }
+
+        #[test]
+        fn a_blocker_found_by_the_survey_reads_well() {
+            assert_eq!(
+                Blocker::Protected(".env".into()).to_string(),
+                "has protected ignored file .env"
+            );
+        }
     }
 
     #[test]
