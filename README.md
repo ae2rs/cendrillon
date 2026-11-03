@@ -105,7 +105,7 @@ It removes a linked worktree, never the main one, when all of these hold:
 ### Limits
 - It needs git in `PATH`, `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`.
 - It sees only your own processes.
-- Each sweep runs `git status` in every worktree past its deadline that it still keeps, a modified one say: about half a second each in a large repository.
+- Each sweep runs `git status` in every worktree past its deadline that it still keeps, a modified one say: about half a second each in a large repository, up to 8 at a time.
 
 ## Where it looks
 - Bazel's default roots: `/private/var/tmp/_bazel_$USER`, `~/Library/Caches/bazel` and `~/.cache/bazel` on macOS; `~/.cache/bazel` and `$XDG_CACHE_HOME/bazel` on Linux.

@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -466,6 +467,52 @@ pub fn allocated(meta: &std::fs::Metadata, seen: &mut HashSet<(u64, u64)>) -> u6
     meta.blocks() * 512
 }
 
+/// How many threads [`par_map`] uses for work that mostly waits: on the disk, or on the git
+/// processes it runs.
+pub fn workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
+}
+
+/// `items.iter().map(f).collect()` on up to `threads` threads, in the same order. A panic in
+/// `f` resumes in the caller.
+pub fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let threads = threads.min(items.len());
+    if threads <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            return done;
+                        };
+                        done.push((index, f(item)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            })
+            .collect()
+    });
+    done.sort_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, result)| result).collect()
+}
+
 #[cfg(test)]
 pub mod testing {
     use std::io::{BufRead, BufReader};
@@ -536,6 +583,25 @@ pub mod testing {
 mod tests {
     use super::testing::LockHolder;
     use super::*;
+
+    #[test]
+    fn par_map_keeps_the_order_and_the_panics() {
+        let items: Vec<u64> = (0..100).collect();
+        let squares = |n: &u64| {
+            // Uneven durations, so threads finish out of order.
+            sleep(Duration::from_micros((n * 37) % 11 * 100));
+            n * n
+        };
+        let expected: Vec<u64> = items.iter().map(squares).collect();
+        assert_eq!(par_map(&items, 8, squares), expected);
+        assert_eq!(par_map(&items, 1, squares), expected);
+        assert!(par_map(&[] as &[u64], 8, squares).is_empty());
+
+        let panicked = std::panic::catch_unwind(|| {
+            par_map(&items, 4, |n| assert_ne!(*n, 42, "boom"));
+        });
+        assert!(panicked.is_err());
+    }
 
     #[test]
     fn lock_is_refused_while_another_process_holds_it() {
