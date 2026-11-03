@@ -6,6 +6,7 @@ mod env;
 mod executor;
 #[cfg(target_os = "macos")]
 mod fsevents;
+mod git;
 #[cfg(target_os = "linux")]
 mod inotify;
 mod inventory;
@@ -15,6 +16,7 @@ mod planner;
 mod sys;
 #[cfg(target_os = "linux")]
 mod systemd;
+mod worktree;
 
 #[cfg(target_os = "macos")]
 use launchd as service;
@@ -34,8 +36,10 @@ use daemon::Cleaner;
 use discovery::State;
 use env::Env;
 use executor::{Executor, format_bytes};
-use inventory::{Item, Usage, Workspace};
+use inventory::{Inventory, Item, Usage, Workspace};
+use planner::{Keep, Verdict};
 use sys::DiskSpace;
+use worktree::{Blocker, Worktree};
 
 /// Deletes the Bazel caches and Cargo build output you no longer use, before they fill your disk.
 #[derive(Parser)]
@@ -50,8 +54,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the Bazel caches and Cargo targets found, with their size and last use.
+    /// List the Bazel caches and Cargo targets found, with their size and last use, and the
+    /// git worktrees when their reaper is enabled.
     Status,
+    /// List the linked git worktrees found, and whether the reaper would remove them.
+    Worktrees,
     /// Run one full cleaning pass now.
     Clean {
         /// Report what would be deleted without deleting anything.
@@ -87,9 +94,11 @@ fn main() -> Result<()> {
         .init();
 
     let env = Env::current()?;
-    let config = Config::load(&cli.config.unwrap_or_else(|| env.config_file()))?;
+    let mut config = Config::load(&cli.config.unwrap_or_else(|| env.config_file()))?;
+    config.worktrees.expand_home(&env.home);
     match cli.command {
         Command::Status => status(&env, &config),
+        Command::Worktrees => worktrees(&env, &config),
         Command::Clean { dry_run } => {
             let stop = AtomicBool::new(false);
             let cleaner = Cleaner {
@@ -131,6 +140,7 @@ fn executor<'a>(config: &Config, dry_run: bool, stop: &'a AtomicBool) -> Executo
         stop,
         unit_idle: config.unit_idle,
         observed: &no_observed_reads,
+        worktrees: config.worktrees.clone(),
     }
 }
 
@@ -145,7 +155,8 @@ fn report(dry_run: bool, freed: u64) {
 }
 
 fn status(env: &Env, config: &Config) -> Result<()> {
-    let inventory = discovery::discover(env, &config.extra_roots, &State::load(&env.state_file()));
+    let state = State::load(&env.state_file());
+    let inventory = discovery::discover(env, &config.extra_roots, &state);
     let usage = Usage::measure(inventory.items(), config.unit_idle);
     let mut rows: Vec<(u64, Item)> = inventory
         .items()
@@ -173,7 +184,101 @@ fn status(env: &Env, config: &Config) -> Result<()> {
         format_bytes(disk.total),
         disk.free_percent()
     );
+    if config.worktrees.enabled {
+        println!();
+        print_worktrees(env, config, &state, &inventory);
+    }
     Ok(())
+}
+
+fn worktrees(env: &Env, config: &Config) -> Result<()> {
+    let state = State::load(&env.state_file());
+    let inventory = discovery::discover(env, &config.extra_roots, &state);
+    print_worktrees(env, config, &state, &inventory);
+    if !config.worktrees.enabled {
+        println!("The reaper is off: set `enabled = true` under `[worktrees]` to turn it on.");
+    }
+    Ok(())
+}
+
+/// The linked worktrees, largest first, with the verdict of a sweep now.
+fn print_worktrees(env: &Env, config: &Config, state: &State, inventory: &Inventory) {
+    let now = SystemTime::now();
+    let repos = discovery::repos(env, state, inventory);
+    let survey = worktree::survey(&repos, inventory, now, &config.worktrees, &env.home);
+    let mut rows: Vec<(u64, Worktree, Verdict)> = survey
+        .worktrees
+        .into_iter()
+        .map(|worktree| {
+            let (size, nested) = worktree::measure(&worktree.path);
+            let verdict = match (planner::verdict(&worktree, now, &config.worktrees), nested) {
+                (Verdict::Reap(_), Some(nested)) => {
+                    Verdict::Keep(Keep::Blocked(Blocker::Nested(nested)))
+                }
+                (verdict, _) => verdict,
+            };
+            (size, worktree, verdict)
+        })
+        .collect();
+    rows.sort_by_key(|(size, ..)| std::cmp::Reverse(*size));
+
+    println!("{:>9}  {:>9}  {:<16}  PATH", "SIZE", "ACTIVE", "KIND");
+    for (size, worktree, verdict) in &rows {
+        let note = match verdict {
+            Verdict::Reap(reason) => format!("would reap: {reason}"),
+            Verdict::Keep(why) => format!("kept: {why}"),
+        };
+        println!(
+            "{:>9}  {:>9}  {:<16}  {}  ({note})",
+            format_bytes(*size),
+            ago(worktree.last_activity),
+            "git worktree",
+            worktree.path.display(),
+        );
+    }
+    for prunable in &survey.prunable {
+        println!(
+            "{:>9}  {:>9}  {:<16}  {}  (would drop: its directory is gone)",
+            "-",
+            "-",
+            "git worktree",
+            prunable.path.display(),
+        );
+    }
+
+    let total: u64 = rows.iter().map(|(size, ..)| size).sum();
+    let reaped: Vec<u64> = rows
+        .iter()
+        .filter(|(_, _, verdict)| matches!(verdict, Verdict::Reap(_)))
+        .map(|(size, ..)| *size)
+        .collect();
+    let mut kept: Vec<(&str, usize)> = Vec::new();
+    for (_, _, verdict) in &rows {
+        if let Verdict::Keep(why) = verdict {
+            match kept.iter_mut().find(|(label, _)| *label == why.label()) {
+                Some((_, count)) => *count += 1,
+                None => kept.push((why.label(), 1)),
+            }
+        }
+    }
+    kept.sort_by_key(|(label, count)| (std::cmp::Reverse(*count), *label));
+    let kept: String = kept
+        .iter()
+        .map(|(label, count)| format!("; {count} kept: {label}"))
+        .collect();
+    println!(
+        "\n{} linked git worktrees, {}. {} would be reaped ({}){kept}.",
+        rows.len(),
+        format_bytes(total),
+        reaped.len(),
+        format_bytes(reaped.iter().sum()),
+    );
+    if !survey.prunable.is_empty() {
+        println!(
+            "{} records of deleted worktrees would be dropped.",
+            survey.prunable.len()
+        );
+    }
 }
 
 fn describe(item: &Item, usage: &Usage) -> (&'static str, Option<SystemTime>, Option<String>) {

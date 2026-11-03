@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::cargo::Target;
-use crate::config::Config;
+use crate::config::{Config, WorktreeConfig};
 use crate::inventory::{AGE_BUCKET, Cache, InstallBase, Inventory, OutputBase, Usage, Workspace};
+use crate::worktree::{self, Blocker, Checks, Done, Prunable, Worktree};
 
 #[derive(Debug)]
 pub enum Sweep {
@@ -53,6 +54,13 @@ pub enum Action {
         target: Target,
         reason: Reason,
     },
+    /// Remove a linked git worktree, after checking everything again.
+    ReapWorktree {
+        worktree: Box<Worktree>,
+        reason: Reason,
+    },
+    /// Drop git's record of a worktree whose directory is gone.
+    PruneWorktree(Prunable),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,18 +68,119 @@ pub enum Reason {
     WorkspaceDeleted(PathBuf),
     Idle(Duration),
     DiskPressure,
+    /// A worktree whose branch is finished, idle this long.
+    Finished(Done, Duration),
 }
 
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Reason::WorkspaceDeleted(path) => write!(f, "workspace {} is gone", path.display()),
-            Reason::Idle(idle) => {
-                let minutes = Duration::from_secs(idle.as_secs() / 60 * 60);
-                write!(f, "unused for {}", humantime::format_duration(minutes))
-            }
+            Reason::Idle(idle) => write!(f, "unused for {}", in_minutes(*idle)),
             Reason::DiskPressure => f.write_str("disk is nearly full"),
+            Reason::Finished(done, idle) => write!(f, "{done}, unused for {}", in_minutes(*idle)),
         }
+    }
+}
+
+fn in_minutes(duration: Duration) -> humantime::FormattedDuration {
+    humantime::format_duration(Duration::from_secs(duration.as_secs() / 60 * 60))
+}
+
+/// What becomes of a linked worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Reap(Reason),
+    Keep(Keep),
+}
+
+/// Why a worktree stays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Keep {
+    Excluded,
+    /// Locked with `git worktree lock`, for this reason.
+    Locked(String),
+    /// Last active this long ago, within its deadline.
+    Active(Duration),
+    /// Its branch is still on this remote branch, unmerged, and it was last active this long
+    /// ago: past the usual deadline, within the longer one of pushed branches.
+    Pushed(String, Duration),
+    Blocked(Blocker),
+    /// Removable as far as the cheap facts go; the slower checks did not run.
+    Unchecked,
+}
+
+impl Keep {
+    /// A few words, to count worktrees by why they stay.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Keep::Excluded => "excluded",
+            Keep::Locked(_) => "locked",
+            Keep::Active(_) => "active",
+            Keep::Pushed(..) => "pushed, not merged",
+            Keep::Blocked(blocker) => blocker.label(),
+            Keep::Unchecked => "not checked",
+        }
+    }
+}
+
+impl fmt::Display for Keep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Keep::Excluded => f.write_str("excluded in the config"),
+            Keep::Locked(why) if why.is_empty() => f.write_str("locked"),
+            Keep::Locked(why) => write!(f, "locked: {why}"),
+            Keep::Active(ago) => write!(f, "active {} ago", coarse(*ago)),
+            Keep::Pushed(remote, ago) => {
+                write!(f, "on {remote}, not merged; active {} ago", coarse(*ago))
+            }
+            Keep::Blocked(blocker) => blocker.fmt(f),
+            Keep::Unchecked => f.write_str("not checked yet"),
+        }
+    }
+}
+
+/// `3d`, `5h` or `12m`.
+pub fn coarse(duration: Duration) -> String {
+    match duration.as_secs() {
+        secs @ 0..3600 => format!("{}m", secs / 60),
+        secs @ 3600..172_800 => format!("{}h", secs / 3600),
+        secs => format!("{}d", secs / 86_400),
+    }
+}
+
+/// Whether a worktree goes. Every condition must hold: not excluded, not locked, idle past
+/// its deadline (shorter once its branch is finished, longer while it is pushed and not
+/// finished), and the slower checks passed: clean,
+/// no operation under way, no protected ignored file, nothing using it.
+pub fn verdict(worktree: &Worktree, now: SystemTime, config: &WorktreeConfig) -> Verdict {
+    if worktree::is_excluded(&worktree.path, &config.exclude) {
+        return Verdict::Keep(Keep::Excluded);
+    }
+    if let Some(why) = &worktree.locked {
+        return Verdict::Keep(Keep::Locked(why.clone()));
+    }
+    let idle = now
+        .duration_since(worktree.last_activity)
+        .unwrap_or_default();
+    let deadline = match (&worktree.done, &worktree.pushed) {
+        (Some(_), _) => config.idle_when_merged,
+        (None, Some(_)) => config.idle_when_pushed,
+        (None, None) => config.idle,
+    };
+    if idle < deadline {
+        return Verdict::Keep(match (&worktree.done, &worktree.pushed) {
+            (None, Some(remote)) if idle >= config.idle => Keep::Pushed(remote.clone(), idle),
+            _ => Keep::Active(idle),
+        });
+    }
+    match &worktree.checks {
+        Checks::Pending => Verdict::Keep(Keep::Unchecked),
+        Checks::Failed(blocker) => Verdict::Keep(Keep::Blocked(blocker.clone())),
+        Checks::Passed => Verdict::Reap(match &worktree.done {
+            Some(done) => Reason::Finished(done.clone(), idle),
+            None => Reason::Idle(idle),
+        }),
     }
 }
 
@@ -223,13 +332,36 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         actions.push(action);
     }
 
-    for target in idle_targets {
+    // A target in a worktree about to go goes with it.
+    let mut reaped: Vec<&Path> = Vec::new();
+    let mut worktree_actions = Vec::new();
+    if config.worktrees.enabled {
+        for worktree in &inventory.worktrees {
+            if let Verdict::Reap(reason) = verdict(worktree, now, &config.worktrees) {
+                reaped.push(&worktree.path);
+                worktree_actions.push(Action::ReapWorktree {
+                    worktree: Box::new(worktree.clone()),
+                    reason,
+                });
+            }
+        }
+        worktree_actions.extend(
+            inventory
+                .prunable
+                .iter()
+                .cloned()
+                .map(Action::PruneWorktree),
+        );
+    }
+    let in_reaped = |target: &Target| reaped.iter().any(|path| target.root.starts_with(path));
+
+    for target in idle_targets.into_iter().filter(|target| !in_reaped(target)) {
         actions.push(Action::DeleteTarget {
             target: target.clone(),
             reason: Reason::Idle(idle_since(target.last_used)),
         });
     }
-    for target in live_targets {
+    for target in live_targets.into_iter().filter(|target| !in_reaped(target)) {
         actions.push(if evicted_targets.contains(target.root.as_path()) {
             Action::DeleteTarget {
                 target: target.clone(),
@@ -239,6 +371,7 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
             Action::TrimTarget(target.clone())
         });
     }
+    actions.extend(worktree_actions);
     actions
 }
 
@@ -528,6 +661,162 @@ mod tests {
             },
         );
         assert!(deleted_bases(&actions).is_empty());
+    }
+
+    fn linked(name: &str, idle: Duration, done: Option<Done>, checks: Checks) -> Worktree {
+        Worktree {
+            path: PathBuf::from(format!("/src/{name}")),
+            repo: worktree::Repo {
+                git_dir: "/src/repo/.git".into(),
+                dir: "/src/repo".into(),
+                default_branch: Some("refs/remotes/origin/main".into()),
+            },
+            admin: Some(format!("/src/repo/.git/worktrees/{name}").into()),
+            head: Some("1111".into()),
+            branch: Some(format!("refs/heads/{name}")),
+            locked: None,
+            last_activity: now() - idle,
+            done,
+            pushed: None,
+            output_bases: Vec::new(),
+            targets: Vec::new(),
+            checks,
+        }
+    }
+
+    fn merged() -> Option<Done> {
+        Some(Done::Merged("refs/remotes/origin/main".into()))
+    }
+
+    #[test]
+    fn a_worktree_goes_only_when_every_condition_holds() {
+        let config = WorktreeConfig::default();
+        let verdict_of = |worktree: &Worktree| verdict(worktree, now(), &config);
+        let day = 24 * HOUR;
+
+        assert_eq!(
+            verdict_of(&linked("idle", 8 * day, None, Checks::Passed)),
+            Verdict::Reap(Reason::Idle(8 * day))
+        );
+        assert_eq!(
+            verdict_of(&linked("merged", 2 * day, merged(), Checks::Passed)),
+            Verdict::Reap(Reason::Finished(merged().unwrap(), 2 * day))
+        );
+        assert_eq!(
+            verdict_of(&linked("unmerged", 2 * day, None, Checks::Passed)),
+            Verdict::Keep(Keep::Active(2 * day))
+        );
+        assert_eq!(
+            verdict_of(&linked("fresh", HOUR, merged(), Checks::Passed)),
+            Verdict::Keep(Keep::Active(HOUR))
+        );
+        assert_eq!(
+            verdict_of(&linked("pending", 8 * day, None, Checks::Pending)),
+            Verdict::Keep(Keep::Unchecked)
+        );
+        let dirty = Checks::Failed(Blocker::Untracked);
+        assert_eq!(
+            verdict_of(&linked("dirty", 8 * day, None, dirty)),
+            Verdict::Keep(Keep::Blocked(Blocker::Untracked))
+        );
+        let locked = Worktree {
+            locked: Some("agent at work".into()),
+            ..linked("locked", 30 * day, merged(), Checks::Passed)
+        };
+        assert_eq!(
+            verdict_of(&locked),
+            Verdict::Keep(Keep::Locked("agent at work".into()))
+        );
+
+        let pushed = |idle| Worktree {
+            pushed: Some("origin/pr".into()),
+            ..linked("pr", idle, None, Checks::Passed)
+        };
+        assert_eq!(
+            verdict_of(&pushed(2 * day)),
+            Verdict::Keep(Keep::Active(2 * day))
+        );
+        assert_eq!(
+            verdict_of(&pushed(8 * day)),
+            Verdict::Keep(Keep::Pushed("origin/pr".into(), 8 * day))
+        );
+        assert_eq!(
+            verdict_of(&pushed(31 * day)),
+            Verdict::Reap(Reason::Idle(31 * day))
+        );
+        let merged_and_pushed = Worktree {
+            pushed: Some("origin/merged".into()),
+            ..linked("merged", 2 * day, merged(), Checks::Passed)
+        };
+        assert_eq!(
+            verdict_of(&merged_and_pushed),
+            Verdict::Reap(Reason::Finished(merged().unwrap(), 2 * day))
+        );
+
+        let excluding = WorktreeConfig {
+            exclude: vec!["/src/idle".into()],
+            ..WorktreeConfig::default()
+        };
+        let idle = linked("idle", 8 * day, None, Checks::Passed);
+        assert_eq!(
+            verdict(&idle, now(), &excluding),
+            Verdict::Keep(Keep::Excluded)
+        );
+    }
+
+    #[test]
+    fn worktrees_are_reaped_on_full_sweeps_when_enabled_with_their_targets() {
+        let day = 24 * HOUR;
+        let gone = linked("gone", 8 * day, None, Checks::Passed);
+        let inventory = Inventory {
+            worktrees: vec![gone.clone(), linked("kept", HOUR, None, Checks::Pending)],
+            prunable: vec![Prunable {
+                repo: gone.repo.clone(),
+                path: "/src/deleted".into(),
+            }],
+            targets: vec![target("gone", HOUR), target("kept", HOUR)],
+            ..Inventory::default()
+        };
+        let enabled = Config {
+            worktrees: WorktreeConfig {
+                enabled: true,
+                ..WorktreeConfig::default()
+            },
+            ..Config::default()
+        };
+        let worktree_actions = |actions: &[Action]| -> Vec<String> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::ReapWorktree { worktree, .. } => {
+                        Some(format!("reap {}", worktree.path.display()))
+                    }
+                    Action::PruneWorktree(prunable) => {
+                        Some(format!("prune {}", prunable.path.display()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let full = plan(&inventory, now(), &enabled, Sweep::Full { pressure: None });
+        assert_eq!(
+            worktree_actions(&full),
+            ["reap /src/gone", "prune /src/deleted"]
+        );
+        // The target in the reaped worktree goes with it.
+        assert_eq!(target_actions(&full), [("/src/kept/target", None)]);
+
+        let orphans = plan(&inventory, now(), &enabled, Sweep::Orphans);
+        assert!(worktree_actions(&orphans).is_empty());
+        let disabled = plan(
+            &inventory,
+            now(),
+            &Config::default(),
+            Sweep::Full { pressure: None },
+        );
+        assert!(worktree_actions(&disabled).is_empty());
+        assert_eq!(target_actions(&disabled).len(), 2);
     }
 
     #[test]

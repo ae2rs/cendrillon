@@ -48,6 +48,48 @@ pub struct Config {
     pub scan_home: bool,
     /// Extra directories to search for Bazel caches, besides the defaults and bazelrc files.
     pub extra_roots: Vec<PathBuf>,
+    /// Removing the git worktrees nobody uses any more.
+    pub worktrees: WorktreeConfig,
+}
+
+/// The `[worktrees]` table: when to remove a linked git worktree. Off unless enabled.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorktreeConfig {
+    pub enabled: bool,
+    /// Remove a clean worktree nothing touched for this long.
+    #[serde(with = "humantime_serde")]
+    pub idle: Duration,
+    /// Sooner when its branch is done: merged into the default branch, or its upstream
+    /// branch deleted.
+    #[serde(with = "humantime_serde")]
+    pub idle_when_merged: Duration,
+    /// Later while its branch is still on a remote and not merged, typically an open pull
+    /// request: the commits are safe there, but the checkout and its build outputs would
+    /// have to be made again for a review round.
+    #[serde(with = "humantime_serde")]
+    pub idle_when_pushed: Duration,
+    /// Worktrees never removed: globs on the path (`~/` expands), or on the directory name
+    /// when they hold no slash. A pattern matching a parent directory covers what is below.
+    pub exclude: Vec<String>,
+    /// A worktree holding an ignored file matching one of these globs is kept: secrets and
+    /// local settings git does not track. A glob without a slash matches the file name.
+    pub protect: Vec<String>,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle: 7 * 24 * HOUR,
+            idle_when_merged: 24 * HOUR,
+            idle_when_pushed: 30 * 24 * HOUR,
+            exclude: Vec::new(),
+            protect: [".env", ".env.*", ".envrc", "user.bazelrc", "*.local.*"]
+                .map(String::from)
+                .to_vec(),
+        }
+    }
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -69,6 +111,18 @@ impl Default for Config {
             pressure_cooldown: Duration::from_secs(600),
             scan_home: true,
             extra_roots: Vec::new(),
+            worktrees: WorktreeConfig::default(),
+        }
+    }
+}
+
+impl WorktreeConfig {
+    /// Expands a leading `~/` in the exclude globs.
+    pub fn expand_home(&mut self, home: &Path) {
+        for glob in &mut self.exclude {
+            if let Some(rest) = glob.strip_prefix("~/") {
+                *glob = home.join(rest).to_string_lossy().into_owned();
+            }
         }
     }
 }
@@ -96,9 +150,26 @@ impl Config {
             ("sweep_interval", config.sweep_interval),
             ("pressure_cooldown", config.pressure_cooldown),
             ("target_idle", config.target_idle),
+            ("worktrees.idle", config.worktrees.idle),
+            (
+                "worktrees.idle_when_merged",
+                config.worktrees.idle_when_merged,
+            ),
+            (
+                "worktrees.idle_when_pushed",
+                config.worktrees.idle_when_pushed,
+            ),
         ];
         for (name, interval) in intervals {
             ensure!(!interval.is_zero(), "{name} must be positive");
+        }
+        let globs = config
+            .worktrees
+            .exclude
+            .iter()
+            .chain(&config.worktrees.protect);
+        for glob in globs {
+            ensure!(!glob.trim().is_empty(), "empty glob in [worktrees]");
         }
         Ok(config)
     }
@@ -140,6 +211,55 @@ mod tests {
         assert!(Config::parse("pressure_free_percent = 30").is_err());
         assert!(Config::parse("pressure_cooldown = \"0s\"").is_err());
         assert!(Config::parse("target_idle = \"0s\"").is_err());
+    }
+
+    #[test]
+    fn worktrees_are_off_by_default_and_configurable() {
+        let defaults = Config::default().worktrees;
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.idle, 7 * 24 * HOUR);
+        assert_eq!(defaults.idle_when_merged, 24 * HOUR);
+        assert_eq!(defaults.idle_when_pushed, 30 * 24 * HOUR);
+        assert!(defaults.protect.contains(&".env".to_string()));
+
+        let config = Config::parse(
+            r#"
+            [worktrees]
+            enabled = true
+            idle = "3d"
+            idle_when_pushed = "14d"
+            exclude = ["~/amo/monorepo-keep-*"]
+            protect = ["*.pem"]
+            "#,
+        )
+        .unwrap();
+        assert!(config.worktrees.enabled);
+        assert_eq!(config.worktrees.idle, 72 * HOUR);
+        assert_eq!(config.worktrees.idle_when_merged, 24 * HOUR);
+        assert_eq!(config.worktrees.idle_when_pushed, 14 * 24 * HOUR);
+        assert_eq!(config.worktrees.exclude, ["~/amo/monorepo-keep-*"]);
+        assert_eq!(config.worktrees.protect, ["*.pem"]);
+        assert_eq!(config.output_base_idle, 24 * HOUR);
+    }
+
+    #[test]
+    fn expands_home_in_excluded_worktrees() {
+        let mut config = WorktreeConfig {
+            exclude: vec!["~/keep".into(), "/tmp/x".into(), "name-*".into()],
+            ..WorktreeConfig::default()
+        };
+        config.expand_home(Path::new("/home/me"));
+        assert_eq!(config.exclude, ["/home/me/keep", "/tmp/x", "name-*"]);
+    }
+
+    #[test]
+    fn rejects_unknown_worktree_keys_and_zero_deadlines() {
+        assert!(Config::parse("[worktrees]\nidle_merged = \"1d\"").is_err());
+        assert!(Config::parse("[worktrees]\nidle = \"0s\"").is_err());
+        assert!(Config::parse("[worktrees]\nidle_when_merged = \"0s\"").is_err());
+        assert!(Config::parse("[worktrees]\nidle_when_pushed = \"0s\"").is_err());
+        assert!(Config::parse("[worktrees]\nexclude = [\"\"]").is_err());
+        assert!(Config::parse("worktrees = true").is_err());
     }
 
     #[test]

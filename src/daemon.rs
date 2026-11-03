@@ -16,6 +16,7 @@ use crate::executor::{Executor, format_bytes};
 use crate::inventory::{Inventory, Usage};
 use crate::planner::{Pressure, Sweep, plan};
 use crate::sys::DiskSpace;
+use crate::worktree;
 
 /// How long to hold off disk-pressure cleanup after a round that did not free space, for
 /// instance because local Time Machine or btrfs snapshots still hold the deleted files.
@@ -40,7 +41,15 @@ pub struct Cleaner<'a> {
 impl Cleaner<'_> {
     /// Finds every cache, plans, then deletes. Returns the bytes freed.
     pub fn pass(&self, state: &State, pass: Pass) -> Result<u64> {
-        let inventory = discovery::discover(self.env, &self.config.extra_roots, state);
+        let mut inventory = discovery::discover(self.env, &self.config.extra_roots, state);
+        let now = SystemTime::now();
+        if self.config.worktrees.enabled && !matches!(pass, Pass::Orphans) {
+            let repos = discovery::repos(self.env, state, &inventory);
+            let config = &self.config.worktrees;
+            let survey = worktree::survey(&repos, &inventory, now, config, &self.env.home);
+            inventory.worktrees = survey.worktrees;
+            inventory.prunable = survey.prunable;
+        }
         let sweep = match pass {
             Pass::Orphans => Sweep::Orphans,
             Pass::Full => Sweep::Full { pressure: None },
@@ -48,7 +57,7 @@ impl Cleaner<'_> {
                 pressure: Some(self.pressure(&inventory, disk)?),
             },
         };
-        let actions = plan(&inventory, SystemTime::now(), self.config, sweep);
+        let actions = plan(&inventory, now, self.config, sweep);
         Ok(self.executor.run(&actions))
     }
 
@@ -123,6 +132,7 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
             stop: &stop,
             unit_idle: config.unit_idle,
             observed: &observed,
+            worktrees: config.worktrees.clone(),
         },
     };
     let mut state = State::load(&env.state_file());
