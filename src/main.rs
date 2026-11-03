@@ -206,11 +206,15 @@ fn print_worktrees(env: &Env, config: &Config, state: &State, inventory: &Invent
     let now = SystemTime::now();
     let repos = discovery::repos(env, state, inventory);
     let survey = worktree::survey(&repos, inventory, now, &config.worktrees, &env.home);
+    // Measuring walks every file: in parallel, the disk reads overlap.
+    let measured = sys::par_map(&survey.worktrees, sys::workers(), |worktree| {
+        worktree::measure(&worktree.path)
+    });
     let mut rows: Vec<(u64, Worktree, Verdict)> = survey
         .worktrees
         .into_iter()
-        .map(|worktree| {
-            let (size, nested) = worktree::measure(&worktree.path);
+        .zip(measured)
+        .map(|(worktree, (size, nested))| {
             let verdict = match (planner::verdict(&worktree, now, &config.worktrees), nested) {
                 (Verdict::Reap(_), Some(nested)) => {
                     Verdict::Keep(Keep::Blocked(Blocker::Nested(nested)))

@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -251,10 +252,9 @@ pub fn survey(
         tracing::warn!("git not found in PATH, /opt/homebrew/bin, /usr/local/bin or /usr/bin");
         return Survey::default();
     }
-    let processes = OnceCell::new();
-    let processes = || processes.get_or_init(sys::open_paths).as_slice();
     let mut seen = HashSet::new();
     let mut survey = Survey::default();
+    let mut linked = Vec::new();
     for git_dir in repos.iter().filter(|dir| !in_skipped_home_dir(dir, home)) {
         let (repo, entries) = match Repo::list(git_dir) {
             Ok(listed) => listed,
@@ -283,11 +283,16 @@ pub fn survey(
                 }
                 continue;
             }
-            let links = Links::from_inventory(&entry.path, inventory);
-            let worktree = inspect(&repo, entry, &links, now, config, false, processes);
-            survey.worktrees.push(worktree);
+            linked.push((repo.clone(), entry.clone()));
         }
     }
+    // Inspecting one runs git a few times; in parallel, the waits overlap.
+    let processes = OnceLock::new();
+    let processes = || processes.get_or_init(sys::open_paths).as_slice();
+    survey.worktrees = sys::par_map(&linked, sys::workers(), |(repo, entry)| {
+        let links = Links::from_inventory(&entry.path, inventory);
+        inspect(repo, entry, &links, now, config, false, processes)
+    });
     survey
 }
 
